@@ -128,10 +128,11 @@ def _cmd_sweep(args) -> int:
 
     er_grid = _floats(args.er)
     prob_grid = _floats(args.prob)
+    bet_types = tuple(x.strip() for x in args.bet_types.split(",") if x.strip())
     settled = harness.collect_settled_candidates(
         args.d_from, args.d_to, args.win_model, args.place_model,
         source=args.source, samples=args.samples, limit=args.limit,
-        show_progress=not args.no_progress,
+        show_progress=not args.no_progress, bet_types=bet_types,
     )
     table = harness.sweep_roi(settled, er_grid, prob_grid)
 
@@ -188,8 +189,11 @@ def main(argv: list[str] | None = None) -> int:
     p_sw.add_argument("--from", dest="d_from", required=True, help="YYYYMMDD")
     p_sw.add_argument("--to", dest="d_to", required=True, help="YYYYMMDD")
     p_sw.add_argument("--limit", type=int, default=None, help="先頭 N レースだけ")
-    p_sw.add_argument("--er", default="1.0,1.1,1.2,1.3,1.5", help="min_er グリッド(カンマ区切り)")
-    p_sw.add_argument("--prob", default="0.0,0.05,0.10,0.15", help="min_prob グリッド(カンマ区切り)")
+    p_sw.add_argument("--er", default="1.0,1.1,1.2,1.3,1.5,2.0", help="min_er グリッド(カンマ区切り)")
+    p_sw.add_argument("--prob", default="0.0,0.05,0.10,0.15,0.20,0.25",
+                      help="min_prob グリッド(カンマ区切り)")
+    p_sw.add_argument("--bet-types", default="place,wide",
+                      help="評価する券種(カンマ区切り)。trio はノイズかつ高コストなので既定で除外")
     p_sw.add_argument("--no-progress", action="store_true")
     p_sw.add_argument("--out", type=Path, default=None, help="全グリッドを CSV 出力")
     p_sw.set_defaults(func=_cmd_sweep)

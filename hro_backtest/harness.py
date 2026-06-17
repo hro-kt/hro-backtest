@@ -207,6 +207,7 @@ def collect_settled_candidates(
     d_from: str, d_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None,
     limit: int | None = None, show_progress: bool = True,
+    bet_types: tuple[str, ...] | None = None,
 ) -> list[tuple]:
     """全レースの「フィルタ前の全候補」を評価し、nl_hr で突合した結果を返す。
 
@@ -214,12 +215,17 @@ def collect_settled_candidates(
     閾値(min_er/min_prob)に依らない重い処理(特徴/PL確率/突合)はここで1回だけ実施し、
     スイープはこのリストの filter+集計で行う（パイプラインを設定ごとに回さない）。
     フラット100円ベット前提（payout_per_100 がそのまま的中時の払戻）。
+
+    bet_types を絞ると評価対象の券種が減る（trio は C(頭数,3) で候補・PL MC の大半を
+    占めるため、不要なら外すと eval パスが大幅に速く・省メモリになる）。
     """
     win_b, place_b = load_models(win_path, place_path)
     d = BettingConfig()
     age = float("inf") if source == "confirmed" else d.max_odds_age_seconds
     # しきい値は無効化（min_er/min_prob=0）。odds 範囲は通常ポリシー(1.5..50)を維持。
-    permissive = BettingConfig(min_expected_return=0.0, min_probability=0.0, max_odds_age_seconds=age)
+    bt_kw = {"allowed_bet_types": tuple(bet_types)} if bet_types else {}
+    permissive = BettingConfig(min_expected_return=0.0, min_probability=0.0,
+                               max_odds_age_seconds=age, **bt_kw)
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
     kelly = KellyConfig()
 
