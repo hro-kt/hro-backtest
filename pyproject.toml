@@ -1,0 +1,28 @@
+[tool.poetry]
+name = "hro-backtest"
+version = "0.1.0"
+description = "E2E ドライバ & ROI バックテスト: predictor→optimizer→moneymanager→settlement(nl_hr) を一気通貫で回し、回収率/的中率を算出する評価基盤"
+authors = ["Horse Racing Optimizer"]
+readme = "README.md"
+license = "Apache-2.0"
+packages = [{ include = "hro_backtest" }]
+
+[tool.poetry.dependencies]
+python = ">=3.10,<3.13"
+# 上流コンポーネント（path/editable）。predictor→features、buyer→moneymanager→optimizer を芋づるで含む。
+hro-predictor = { path = "../hro-predictor", develop = true }
+hro-buyer = { path = "../hro-buyer", develop = true }
+# DB 接続(nl_hr/オッズ)と PL モンテカルロ、.env ロード。
+psycopg = { version = ">=3.1", extras = ["binary"] }
+numpy = ">=1.24"
+python-dotenv = ">=1.0"
+
+[tool.poetry.group.dev.dependencies]
+pytest = ">=7.4"
+
+[tool.poetry.scripts]
+hro-backtest = "hro_backtest.__main__:main"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

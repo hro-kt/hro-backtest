@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# venv / poetry
+.venv/
+dist/
+build/
+
+# secrets / local config
+.env
+*/.env
+config.yaml
+*/config.yaml
+
+# logs / data
+*.log
+data/
+
+.DS_Store
+.idea/
+.vscode/
