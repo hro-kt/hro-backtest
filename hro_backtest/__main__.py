@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import sys
 from pathlib import Path
 
 
@@ -95,16 +94,12 @@ def _fmt(s) -> str:
 def _cmd_backtest(args) -> int:
     from . import harness
 
-    def progress(i, n, rid):
-        if i % 100 == 0 or i == n:
-            print(f"  ... {i}/{n} races", file=sys.stderr)
-
     res = harness.run_backtest(
         args.d_from, args.d_to, args.win_model, args.place_model,
         source=args.source, samples=args.samples, max_total=args.max_total,
         independent_kelly=args.independent_kelly, min_er=args.min_er,
         min_prob=args.min_prob, max_odds_age=args.max_odds_age, limit=args.limit,
-        progress=progress,
+        show_progress=not args.no_progress,
     )
     print(f"\n=== Backtest [{args.d_from}..{args.d_to}] source={args.source} ===")
     print(f"races={res.n_races} with_orders={res.n_races_with_orders}")
@@ -121,6 +116,46 @@ def _cmd_backtest(args) -> int:
                 w.writerow([s.race_id, s.selection_id, s.bet_type, s.amount, s.odds,
                             s.settled, s.hit, s.payout, s.pnl])
         print(f"-> wrote per-bet settlements to {args.out}")
+    return 0
+
+
+def _floats(s: str) -> list[float]:
+    return [float(x) for x in s.split(",") if x.strip() != ""]
+
+
+def _cmd_sweep(args) -> int:
+    from . import harness
+
+    er_grid = _floats(args.er)
+    prob_grid = _floats(args.prob)
+    settled = harness.collect_settled_candidates(
+        args.d_from, args.d_to, args.win_model, args.place_model,
+        source=args.source, samples=args.samples, limit=args.limit,
+        show_progress=not args.no_progress,
+    )
+    table = harness.sweep_roi(settled, er_grid, prob_grid)
+
+    print(f"\n=== Sweep [{args.d_from}..{args.d_to}] source={args.source} "
+          f"(flat ¥100/bet, ROI=payout/stake; cell='ROI(n)') ===")
+    for t in ("ALL", "place", "wide", "trio"):
+        print(f"\n[{t}]  rows=min_er, cols=min_prob")
+        print("  min_er \\ min_prob | " + " | ".join(f"{p:>11.2f}" for p in prob_grid))
+        for er in er_grid:
+            cells = []
+            for p in prob_grid:
+                n, roi, _ = table[t][(er, p)]
+                cells.append(f"{('--' if roi is None else f'{roi:.3f}'):>6}({n:>4})" if n else f"{'--':>11}")
+            print(f"  {er:>16.2f} | " + " | ".join(cells))
+
+    if args.out:
+        with open(args.out, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["bet_type", "min_er", "min_prob", "n", "roi", "hit_rate"])
+            for t, cells in table.items():
+                for (er, p), (n, roi, hr) in cells.items():
+                    w.writerow([t, er, p, n, "" if roi is None else f"{roi:.4f}",
+                                "" if hr is None else f"{hr:.4f}"])
+        print(f"\n-> wrote full sweep grid to {args.out}")
     return 0
 
 
@@ -141,8 +176,23 @@ def main(argv: list[str] | None = None) -> int:
     p_bt.add_argument("--from", dest="d_from", required=True, help="YYYYMMDD")
     p_bt.add_argument("--to", dest="d_to", required=True, help="YYYYMMDD")
     p_bt.add_argument("--limit", type=int, default=None, help="先頭 N レースだけ(動作確認用)")
+    p_bt.add_argument("--no-progress", action="store_true", help="進捗バーを表示しない")
     p_bt.add_argument("--out", type=Path, default=None, help="各 bet の突合結果を CSV 出力")
     p_bt.set_defaults(func=_cmd_backtest)
+
+    p_sw = sub.add_parser("sweep", help="min_er×min_prob のグリッドで ROI を一括比較(フラット¥100)")
+    p_sw.add_argument("--win-model", required=True)
+    p_sw.add_argument("--place-model", required=True)
+    p_sw.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
+    p_sw.add_argument("--samples", type=int, default=None, help="PL モンテカルロのサンプル数")
+    p_sw.add_argument("--from", dest="d_from", required=True, help="YYYYMMDD")
+    p_sw.add_argument("--to", dest="d_to", required=True, help="YYYYMMDD")
+    p_sw.add_argument("--limit", type=int, default=None, help="先頭 N レースだけ")
+    p_sw.add_argument("--er", default="1.0,1.1,1.2,1.3,1.5", help="min_er グリッド(カンマ区切り)")
+    p_sw.add_argument("--prob", default="0.0,0.05,0.10,0.15", help="min_prob グリッド(カンマ区切り)")
+    p_sw.add_argument("--no-progress", action="store_true")
+    p_sw.add_argument("--out", type=Path, default=None, help="全グリッドを CSV 出力")
+    p_sw.set_defaults(func=_cmd_sweep)
 
     args = parser.parse_args(argv)
     return args.func(args)

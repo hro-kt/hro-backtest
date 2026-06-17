@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass
 
 from hro_features.config import load_config as load_features_config
@@ -24,6 +25,7 @@ from hro_predictor.predict import score_abilities, TARGET_PLACE, TARGET_WIN
 
 from hro_optimizer.config import BettingConfig, KellyConfig, SimConfig
 from hro_optimizer.db import PostgresConfig, connect as opt_connect, load_odds_lookup
+from hro_optimizer.engine import decide_race
 from hro_optimizer.io import race_abilities_from_dict
 
 from hro_moneymanager.config import MoneyManagerConfig
@@ -31,7 +33,7 @@ from hro_moneymanager.pipeline import run_decide_pipeline
 
 from hro_buyer.models import STATUS_DRY_RUN, ExecutionResult
 from hro_buyer.postgres import load_payout_rows
-from hro_buyer.settlement import build_payout_index, settle_results, summarize
+from hro_buyer.settlement import build_payout_index, settle_result, settle_results, summarize
 
 RaceKey = tuple[str, str, str, str, str, str]
 
@@ -114,16 +116,27 @@ class BacktestResult:
     settlements: list                # 個別 Settlement（詳細出力・CSV 用）
 
 
+def _progress_bar(total: int, show: bool):
+    """tqdm があれば進捗バー、無ければ None（呼び出し側が periodic ログにフォールバック）。"""
+    if not show:
+        return None
+    try:
+        from tqdm import tqdm
+    except ModuleNotFoundError:
+        return None
+    return tqdm(total=total, unit="race", desc="backtest", file=sys.stderr)
+
+
 def run_backtest(
     d_from: str, d_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None, max_total: float | None = None,
     independent_kelly: bool = False, min_er=None, min_prob=None, max_odds_age=None,
-    limit: int | None = None, progress=None,
+    limit: int | None = None, show_progress: bool = True,
 ) -> BacktestResult:
     """期間バックテスト: 各レースで bet を生成し、nl_hr 払戻と突合して ROI を出す。
 
     資金配分はレース独立(store なし)。ROI は比率なので予算スケールに非依存。
-    progress(i, n, race_id) を渡すと進捗コールバックされる。
+    show_progress=True で tqdm 進捗バー(未導入時は 100 レース毎に stderr へログ)。
     """
     win_b, place_b = load_models(win_path, place_path)
     betting = betting_config(source, min_er=min_er, min_prob=min_prob, max_odds_age=max_odds_age)
@@ -135,8 +148,10 @@ def run_backtest(
     conn_odds = opt_connect()
     all_orders: list = []
     n_with = 0
+    races = list_races(db, d_from, d_to, limit=limit)
+    n = len(races)
+    bar = _progress_bar(n, show_progress)
     try:
-        races = list_races(db, d_from, d_to, limit=limit)
         for i, race in enumerate(races, 1):
             _, orders = orders_for_race(
                 db, conn_odds, win_b, place_b, race,
@@ -146,11 +161,20 @@ def run_backtest(
             if orders:
                 n_with += 1
                 all_orders.extend(orders)
-            if progress:
-                progress(i, len(races), "".join(race))
+            if bar is not None:
+                bar.update(1)
+                bar.set_postfix(bets=len(all_orders), w_orders=n_with)
+            elif show_progress and (i % 100 == 0 or i == n):
+                print(f"  ... {i}/{n} races (bets={len(all_orders)})", file=sys.stderr)
     finally:
+        if bar is not None:
+            bar.close()
         conn_odds.close()
         db.close()
+
+    if show_progress:
+        print(f"settling {len(all_orders)} bets over {len(set(o.race_id for o in all_orders))} races "
+              f"against nl_hr ...", file=sys.stderr)
 
     # settlement: nl_hr は tuple-row で読む（load_payout_rows がタプル展開のため）
     import psycopg
@@ -174,3 +198,108 @@ def run_backtest(
         n_races=len(races), n_races_with_orders=n_with,
         summary=summarize(settlements), by_bet_type=by_type, settlements=settlements,
     )
+
+
+# --------------------------------------------------------------------------- #
+# 閾値スイープ: 全候補を1パスで評価＆突合 → グリッドはメモリ集計（フラット100円ベット）
+# --------------------------------------------------------------------------- #
+def collect_settled_candidates(
+    d_from: str, d_to: str, win_path: str, place_path: str, *,
+    source: str = "confirmed", samples: int | None = None,
+    limit: int | None = None, show_progress: bool = True,
+) -> list[tuple]:
+    """全レースの「フィルタ前の全候補」を評価し、nl_hr で突合した結果を返す。
+
+    返り: list[(bet_type, expected_return, probability, settled, hit, payout_per_100)]。
+    閾値(min_er/min_prob)に依らない重い処理(特徴/PL確率/突合)はここで1回だけ実施し、
+    スイープはこのリストの filter+集計で行う（パイプラインを設定ごとに回さない）。
+    フラット100円ベット前提（payout_per_100 がそのまま的中時の払戻）。
+    """
+    win_b, place_b = load_models(win_path, place_path)
+    d = BettingConfig()
+    age = float("inf") if source == "confirmed" else d.max_odds_age_seconds
+    # しきい値は無効化（min_er/min_prob=0）。odds 範囲は通常ポリシー(1.5..50)を維持。
+    permissive = BettingConfig(min_expected_return=0.0, min_probability=0.0, max_odds_age_seconds=age)
+    sim = SimConfig(n_samples=samples) if samples else SimConfig()
+    kelly = KellyConfig()
+
+    db = FeatureDB(load_features_config())
+    conn_odds = opt_connect()
+    cands: list[tuple] = []   # (bet_type, race_id, selection_id, er, prob, odds)
+    races = list_races(db, d_from, d_to, limit=limit)
+    bar = _progress_bar(len(races), show_progress)
+    try:
+        for race in races:
+            rows = build_race_features(db, *race)
+            if rows:
+                race_id = "".join(race)
+                ab = race_abilities_from_dict(score_abilities(rows, win_b, place_b, race_id))
+                odds_lookup = load_odds_lookup(conn_odds, race, source=source)
+                res = decide_race(ab, odds_lookup, permissive,
+                                  sim_config=sim, kelly_config=kelly, simultaneous=False)
+                for c in res.candidates:
+                    cands.append((c.bet_type, c.race_id, c.selection_id,
+                                  c.expected_return, c.probability, c.odds))
+            if bar is not None:
+                bar.update(1)
+                bar.set_postfix(cands=len(cands))
+    finally:
+        if bar is not None:
+            bar.close()
+        conn_odds.close()
+        db.close()
+
+    # 一括突合（nl_hr は tuple-row で読む）
+    import psycopg
+    if show_progress:
+        print(f"settling {len(cands)} candidates against nl_hr ...", file=sys.stderr)
+    race_ids = {c[1] for c in cands}
+    conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
+    try:
+        payout_rows = load_payout_rows(conn_hr, race_ids)
+    finally:
+        conn_hr.close()
+    index, settled_races = build_payout_index(payout_rows)
+
+    out: list[tuple] = []
+    for bt, rid, sel, er, prob, odds in cands:
+        s = settle_result(
+            ExecutionResult(race_id=rid, selection_id=sel, bet_type=bt, amount=100,
+                            odds=odds, mode="dry_run", status=STATUS_DRY_RUN, message="sweep"),
+            index, settled_races,
+        )
+        out.append((bt, er, prob, s.settled, s.hit, s.payout))
+    return out
+
+
+def sweep_roi(
+    settled: list[tuple], er_grid: list[float], prob_grid: list[float],
+) -> dict[str, dict[tuple[float, float], tuple[int, float | None, float | None]]]:
+    """評価済み候補から (min_er, min_prob) ごとの ROI を集計（フラット100円ベット）。
+
+    返り: {bet_type or 'ALL': {(er, prob): (n, roi, hit_rate)}}。
+    roi = 払戻合計 / 投資合計、hit_rate = 的中 / ベット数（確定分のみ）。
+    """
+    types = ["ALL", "place", "wide", "trio"]
+    table: dict[str, dict] = {t: {} for t in types}
+    for er in er_grid:
+        for pr in prob_grid:
+            acc = {t: [0, 0, 0, 0] for t in types}  # n, stake, payout, hits
+            for bt, e, p, st, hit, pay in settled:
+                if not st or e < er or p < pr:
+                    continue
+                for key in ("ALL", bt):
+                    a = acc.get(key)
+                    if a is None:
+                        continue
+                    a[0] += 1
+                    a[1] += 100
+                    a[2] += pay
+                    a[3] += 1 if hit else 0
+            for t in types:
+                n, stake, payout, hits = acc[t]
+                roi = (payout / stake) if stake else None
+                hr = (hits / n) if n else None
+                table[t][(er, pr)] = (n, roi, hr)
+    return table
+
