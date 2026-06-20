@@ -148,6 +148,19 @@ def _cmd_sweep(args) -> int:
                 cells.append(f"{('--' if roi is None else f'{roi:.3f}'):>6}({n:>4})" if n else f"{'--':>11}")
             print(f"  {er:>16.2f} | " + " | ".join(cells))
 
+    # オッズ帯別 ROI（人気-穴バイアス検証）
+    cuts = _floats(args.odds_bands)
+    ob, bands = harness.odds_band_roi(settled, cuts, ref_er=args.ref_er, ref_prob=args.ref_prob)
+    print(f"\n=== Odds-band ROI  (ref: min_er>={args.ref_er}, min_prob>={args.ref_prob}; cell='ROI(n)') ===")
+    for t in ("ALL", "place", "wide", "trio"):
+        print(f"\n[{t}]")
+        print("  band | " + " | ".join(f"{lo:g}-{hi:g}".rjust(12) for lo, hi in bands))
+        cells = []
+        for b in bands:
+            n, roi, _ = ob[t][b]
+            cells.append(f"{('--' if roi is None else f'{roi:.3f}'):>6}({n:>5})" if n else f"{'--':>12}")
+        print("  ROI  | " + " | ".join(cells))
+
     if args.out:
         with open(args.out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
@@ -157,6 +170,47 @@ def _cmd_sweep(args) -> int:
                     w.writerow([t, er, p, n, "" if roi is None else f"{roi:.4f}",
                                 "" if hr is None else f"{hr:.4f}"])
         print(f"\n-> wrote full sweep grid to {args.out}")
+    return 0
+
+
+def _cmd_calib(args) -> int:
+    from . import harness
+
+    bet_types = tuple(x.strip() for x in args.bet_types.split(",") if x.strip())
+    settled = harness.collect_settled_candidates(
+        args.d_from, args.d_to, args.win_model, args.place_model,
+        source=args.source, samples=args.samples, limit=args.limit,
+        show_progress=not args.no_progress, bet_types=bet_types,
+    )
+    table = harness.calibration_table(settled, bins=args.bins)
+
+    print(f"\n=== Calibration [{args.d_from}..{args.d_to}] source={args.source} "
+          f"(settled bets only; deciles of model p) ===")
+    print("  予測>実績 が続く=過信(EV水増し)、予測≈実績=較正OK(効率的市場)")
+    for t in ("place", "wide", "trio"):
+        groups = table.get(t)
+        if not groups:
+            continue
+        # 全体の予測平均 vs 実績平均（グローバル較正）
+        n_all = sum(g[1] for g in groups)
+        pred_all = sum(g[2] * g[1] for g in groups) / n_all
+        act_all = sum(g[3] * g[1] for g in groups) / n_all
+        print(f"\n[{t}]  n={n_all}  overall: pred={pred_all:.3f} actual={act_all:.3f} "
+              f"(ratio={act_all / pred_all:.2f})" if pred_all else f"\n[{t}]")
+        print("  decile |     n | mean_pred |  actual |  ratio |   ROI")
+        for b, n, pred, act, roi in groups:
+            ratio = (act / pred) if pred else float("nan")
+            print(f"   {b:>2}/{args.bins:<2} | {n:>5} |   {pred:.4f} |  {act:.4f} | "
+                  f"{ratio:>5.2f}  | {roi:.3f}")
+
+    if args.out:
+        with open(args.out, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(["bet_type", "decile", "n", "mean_pred", "actual_rate", "roi"])
+            for t, groups in table.items():
+                for b, n, pred, act, roi in groups:
+                    w.writerow([t, b, n, f"{pred:.5f}", f"{act:.5f}", f"{roi:.4f}"])
+        print(f"\n-> wrote calibration to {args.out}")
     return 0
 
 
@@ -194,9 +248,30 @@ def main(argv: list[str] | None = None) -> int:
                       help="min_prob グリッド(カンマ区切り)")
     p_sw.add_argument("--bet-types", default="place,wide",
                       help="評価する券種(カンマ区切り)。trio はノイズかつ高コストなので既定で除外")
+    p_sw.add_argument("--odds-bands", default="1.5,3,6,12,25,50",
+                      help="オッズ帯の区切り(カンマ区切り)。人気-穴バイアス検証用")
+    p_sw.add_argument("--ref-er", type=float, default=1.0,
+                      help="オッズ帯分析の参照 min_er(既定1.0=ほぼ全候補)")
+    p_sw.add_argument("--ref-prob", type=float, default=0.0,
+                      help="オッズ帯分析の参照 min_prob(既定0.0)")
     p_sw.add_argument("--no-progress", action="store_true")
     p_sw.add_argument("--out", type=Path, default=None, help="全グリッドを CSV 出力")
     p_sw.set_defaults(func=_cmd_sweep)
+
+    p_cal = sub.add_parser("calib", help="較正診断: モデル確率 vs 実的中率(デシル別)")
+    p_cal.add_argument("--win-model", required=True)
+    p_cal.add_argument("--place-model", required=True)
+    p_cal.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
+    p_cal.add_argument("--samples", type=int, default=None)
+    p_cal.add_argument("--from", dest="d_from", required=True, help="YYYYMMDD")
+    p_cal.add_argument("--to", dest="d_to", required=True, help="YYYYMMDD")
+    p_cal.add_argument("--limit", type=int, default=None)
+    p_cal.add_argument("--bins", type=int, default=10, help="分位ビン数(既定10=デシル)")
+    p_cal.add_argument("--bet-types", default="place,wide",
+                       help="評価する券種(カンマ区切り)。trio も見るなら place,wide,trio")
+    p_cal.add_argument("--no-progress", action="store_true")
+    p_cal.add_argument("--out", type=Path, default=None, help="較正表を CSV 出力")
+    p_cal.set_defaults(func=_cmd_calib)
 
     args = parser.parse_args(argv)
     return args.func(args)

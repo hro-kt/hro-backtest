@@ -213,7 +213,7 @@ def collect_settled_candidates(
 ) -> list[tuple]:
     """全レースの「フィルタ前の全候補」を評価し、nl_hr で突合した結果を返す。
 
-    返り: list[(bet_type, expected_return, probability, settled, hit, payout_per_100)]。
+    返り: list[(bet_type, expected_return, probability, odds, settled, hit, payout_per_100)]。
     閾値(min_er/min_prob)に依らない重い処理(特徴/PL確率/突合)はここで1回だけ実施し、
     スイープはこのリストの filter+集計で行う（パイプラインを設定ごとに回さない）。
     フラット100円ベット前提（payout_per_100 がそのまま的中時の払戻）。
@@ -236,8 +236,8 @@ def collect_settled_candidates(
     db = FeatureDB(load_features_config())
     conn_odds = opt_connect()
     conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
-    out: list[tuple] = []   # (bet_type, er, prob, settled, hit, payout_per_100)
-    run = [0, 0]            # staked, payout（全候補フラット¥100の走行中ROI）
+    out: list[tuple] = []   # (bet_type, er, prob, odds, settled, hit, payout_per_100)
+    run = [0, 0, 0.0, 0, 0]  # staked, payout, Σpred, Σhit, n_settled（走行中ROI＋較正比）
     races = list_races(db, d_from, d_to, limit=limit)
     bar = _progress_bar(len(races), show_progress)
     try:
@@ -259,18 +259,25 @@ def collect_settled_candidates(
                             idx, settled_races,
                         )
                         out.append((c.bet_type, c.expected_return, c.probability,
-                                    s.settled, s.hit, s.payout))
+                                    c.odds, s.settled, s.hit, s.payout))
                         if s.settled:
                             run[0] += 100
                             run[1] += s.payout
+                            run[2] += c.probability
+                            run[3] += 1 if s.hit else 0
+                            run[4] += 1
             if bar is not None:
                 bar.update(1)
                 roi = (run[1] / run[0]) if run[0] else None
-                bar.set_postfix(cands=len(out), ROI=("--" if roi is None else f"{roi:.3f}"))
+                cal = (run[3] / run[2]) if run[2] else None
+                bar.set_postfix(cands=len(out),
+                                ROI=("--" if roi is None else f"{roi:.3f}"),
+                                cal=("--" if cal is None else f"{cal:.2f}"))
             elif show_progress and (i % 100 == 0 or i == len(races)):
                 roi = (run[1] / run[0]) if run[0] else float("nan")
-                print(f"  ... {i}/{len(races)} races cands={len(out)} ROI(all)={roi:.3f}",
-                      file=sys.stderr)
+                cal = (run[3] / run[2]) if run[2] else float("nan")
+                print(f"  ... {i}/{len(races)} races cands={len(out)} "
+                      f"ROI(all)={roi:.3f} cal(actual/pred)={cal:.2f}", file=sys.stderr)
     finally:
         if bar is not None:
             bar.close()
@@ -293,7 +300,7 @@ def sweep_roi(
     for er in er_grid:
         for pr in prob_grid:
             acc = {t: [0, 0, 0, 0] for t in types}  # n, stake, payout, hits
-            for bt, e, p, st, hit, pay in settled:
+            for bt, e, p, odds, st, hit, pay in settled:
                 if not st or e < er or p < pr:
                     continue
                 for key in ("ALL", bt):
@@ -310,4 +317,80 @@ def sweep_roi(
                 hr = (hits / n) if n else None
                 table[t][(er, pr)] = (n, roi, hr)
     return table
+
+
+def calibration_table(
+    settled: list[tuple], bins: int = 10,
+) -> dict[str, list[tuple[int, int, float, float, float]]]:
+    """較正診断: 券種ごとに、モデル確率の分位ビンで「予測 vs 実績」を集計。
+
+    settled の各要素 (bet_type, er, prob, odds, settled, hit, payout) のうち確定分のみ使用。
+    返り: {bet_type: [(bin, n, mean_pred, actual_rate, roi), ...]}（bin は確率の低→高デシル）。
+    高確率ビンで mean_pred > actual_rate が続く＝過信（EV 水増し→ -EV を +EV と誤認）。
+    """
+    from collections import defaultdict
+
+    by: dict[str, list] = defaultdict(list)
+    for bt, _er, prob, _odds, st, hit, pay in settled:
+        if st:
+            by[bt].append((prob, 1 if hit else 0, pay))
+
+    out: dict[str, list] = {}
+    for bt, rows in by.items():
+        rows.sort(key=lambda x: x[0])
+        n = len(rows)
+        if n == 0:
+            continue
+        groups = []
+        for k in range(bins):
+            chunk = rows[k * n // bins:(k + 1) * n // bins]
+            m = len(chunk)
+            if not m:
+                continue
+            mean_pred = sum(r[0] for r in chunk) / m
+            actual = sum(r[1] for r in chunk) / m
+            roi = sum(r[2] for r in chunk) / (100 * m)
+            groups.append((k + 1, m, mean_pred, actual, roi))
+        out[bt] = groups
+    return out
+
+
+def odds_band_roi(
+    settled: list[tuple], cuts: list[float], *, ref_er: float = 1.0, ref_prob: float = 0.0,
+) -> tuple[dict[str, dict[tuple[float, float], tuple[int, float | None, float | None]]], list]:
+    """オッズ帯別 ROI（人気-穴バイアス検証）。cuts=[1.5,3,6,...] を区間に区切る。
+
+    ref_er/ref_prob を満たす候補を、オッズ帯ごとにフラット¥100で集計。
+    低オッズ(本命)帯の ROI が高オッズ(穴)帯より高ければ、人気-穴バイアスの裏。
+    返り: ({bet_type: {(lo,hi): (n, roi, hit_rate)}}, bands)。
+    """
+    bands = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
+    types = ["ALL", "place", "wide", "trio"]
+    acc = {t: {b: [0, 0, 0, 0] for b in bands} for t in types}
+    last_hi = bands[-1][1] if bands else None
+    for bt, e, p, odds, st, hit, pay in settled:
+        if not st or e < ref_er or p < ref_prob:
+            continue
+        band = None
+        for lo, hi in bands:
+            if odds >= lo and (odds < hi or (hi == last_hi and odds <= hi)):
+                band = (lo, hi)
+                break
+        if band is None:
+            continue
+        for key in ("ALL", bt):
+            a = acc.get(key)
+            if a is None:
+                continue
+            cell = a[band]
+            cell[0] += 1
+            cell[1] += 100
+            cell[2] += pay
+            cell[3] += 1 if hit else 0
+    table = {t: {} for t in types}
+    for t in types:
+        for b in bands:
+            n, stake, payout, hits = acc[t][b]
+            table[t][b] = (n, (payout / stake) if stake else None, (hits / n) if n else None)
+    return table, bands
 
