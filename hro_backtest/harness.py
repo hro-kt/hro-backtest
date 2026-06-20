@@ -144,10 +144,14 @@ def run_backtest(
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
     kelly = KellyConfig(max_total=max_total) if max_total else KellyConfig()
 
+    # nl_hr は tuple-row で読む（load_payout_rows がタプル展開のため）別接続を保持
+    import psycopg
     db = FeatureDB(load_features_config())
     conn_odds = opt_connect()
-    all_orders: list = []
+    conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
     n_with = 0
+    settlements: list = []
+    run = [0, 0, 0]  # staked, payout, n_settled（走行中ROI表示用）
     races = list_races(db, d_from, d_to, limit=limit)
     n = len(races)
     bar = _progress_bar(n, show_progress)
@@ -160,33 +164,31 @@ def run_backtest(
             )
             if orders:
                 n_with += 1
-                all_orders.extend(orders)
+                # 1レースぶんを即突合 → 走行中ROIを更新（途中経過が見える）
+                idx, settled = build_payout_index(load_payout_rows(conn_hr, {orders[0].race_id}))
+                sts = settle_results([_to_exec(o) for o in orders], idx, settled)
+                settlements.extend(sts)
+                for s in sts:
+                    if s.settled:
+                        run[0] += s.amount
+                        run[1] += s.payout
+                        run[2] += 1
             if bar is not None:
                 bar.update(1)
-                bar.set_postfix(bets=len(all_orders), w_orders=n_with)
+                roi = (run[1] / run[0]) if run[0] else None
+                bar.set_postfix(bets=len(settlements), w_orders=n_with,
+                                ROI=("--" if roi is None else f"{roi:.3f}"),
+                                pnl=run[1] - run[0])
             elif show_progress and (i % 100 == 0 or i == n):
-                print(f"  ... {i}/{n} races (bets={len(all_orders)})", file=sys.stderr)
+                roi = (run[1] / run[0]) if run[0] else float("nan")
+                print(f"  ... {i}/{n} races bets={len(settlements)} "
+                      f"ROI={roi:.3f} pnl={run[1] - run[0]:+d}", file=sys.stderr)
     finally:
         if bar is not None:
             bar.close()
+        conn_hr.close()
         conn_odds.close()
         db.close()
-
-    if show_progress:
-        print(f"settling {len(all_orders)} bets over {len(set(o.race_id for o in all_orders))} races "
-              f"against nl_hr ...", file=sys.stderr)
-
-    # settlement: nl_hr は tuple-row で読む（load_payout_rows がタプル展開のため）
-    import psycopg
-    results = [_to_exec(o) for o in all_orders]
-    race_ids = {o.race_id for o in all_orders}
-    conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
-    try:
-        payout_rows = load_payout_rows(conn_hr, race_ids)
-    finally:
-        conn_hr.close()
-    index, settled = build_payout_index(payout_rows)
-    settlements = settle_results(results, index, settled)
 
     by_type = {}
     for bt in ("place", "wide", "trio", "win"):
@@ -229,13 +231,17 @@ def collect_settled_candidates(
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
     kelly = KellyConfig()
 
+    # nl_hr は tuple-row で読む別接続を保持し、1レースぶんを即突合（走行中ROIを表示）
+    import psycopg
     db = FeatureDB(load_features_config())
     conn_odds = opt_connect()
-    cands: list[tuple] = []   # (bet_type, race_id, selection_id, er, prob, odds)
+    conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
+    out: list[tuple] = []   # (bet_type, er, prob, settled, hit, payout_per_100)
+    run = [0, 0]            # staked, payout（全候補フラット¥100の走行中ROI）
     races = list_races(db, d_from, d_to, limit=limit)
     bar = _progress_bar(len(races), show_progress)
     try:
-        for race in races:
+        for i, race in enumerate(races, 1):
             rows = build_race_features(db, *race)
             if rows:
                 race_id = "".join(race)
@@ -243,38 +249,34 @@ def collect_settled_candidates(
                 odds_lookup = load_odds_lookup(conn_odds, race, source=source)
                 res = decide_race(ab, odds_lookup, permissive,
                                   sim_config=sim, kelly_config=kelly, simultaneous=False)
-                for c in res.candidates:
-                    cands.append((c.bet_type, c.race_id, c.selection_id,
-                                  c.expected_return, c.probability, c.odds))
+                if res.candidates:
+                    idx, settled_races = build_payout_index(load_payout_rows(conn_hr, {race_id}))
+                    for c in res.candidates:
+                        s = settle_result(
+                            ExecutionResult(race_id=c.race_id, selection_id=c.selection_id,
+                                            bet_type=c.bet_type, amount=100, odds=c.odds,
+                                            mode="dry_run", status=STATUS_DRY_RUN, message="sweep"),
+                            idx, settled_races,
+                        )
+                        out.append((c.bet_type, c.expected_return, c.probability,
+                                    s.settled, s.hit, s.payout))
+                        if s.settled:
+                            run[0] += 100
+                            run[1] += s.payout
             if bar is not None:
                 bar.update(1)
-                bar.set_postfix(cands=len(cands))
+                roi = (run[1] / run[0]) if run[0] else None
+                bar.set_postfix(cands=len(out), ROI=("--" if roi is None else f"{roi:.3f}"))
+            elif show_progress and (i % 100 == 0 or i == len(races)):
+                roi = (run[1] / run[0]) if run[0] else float("nan")
+                print(f"  ... {i}/{len(races)} races cands={len(out)} ROI(all)={roi:.3f}",
+                      file=sys.stderr)
     finally:
         if bar is not None:
             bar.close()
+        conn_hr.close()
         conn_odds.close()
         db.close()
-
-    # 一括突合（nl_hr は tuple-row で読む）
-    import psycopg
-    if show_progress:
-        print(f"settling {len(cands)} candidates against nl_hr ...", file=sys.stderr)
-    race_ids = {c[1] for c in cands}
-    conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
-    try:
-        payout_rows = load_payout_rows(conn_hr, race_ids)
-    finally:
-        conn_hr.close()
-    index, settled_races = build_payout_index(payout_rows)
-
-    out: list[tuple] = []
-    for bt, rid, sel, er, prob, odds in cands:
-        s = settle_result(
-            ExecutionResult(race_id=rid, selection_id=sel, bet_type=bt, amount=100,
-                            odds=odds, mode="dry_run", status=STATUS_DRY_RUN, message="sweep"),
-            index, settled_races,
-        )
-        out.append((bt, er, prob, s.settled, s.hit, s.payout))
     return out
 
 
