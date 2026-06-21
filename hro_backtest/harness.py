@@ -21,6 +21,7 @@ from hro_features.online import build_race_features
 from hro_features.spec import FEATURE_COLUMNS, feature_schema_hash
 
 from hro_predictor.bundle import ModelBundle
+from hro_predictor.model import apply_calibrator, fit_calibrator
 from hro_predictor.predict import score_abilities, TARGET_PLACE, TARGET_WIN
 
 from hro_optimizer.config import BettingConfig, KellyConfig, SimConfig
@@ -373,6 +374,53 @@ def calibration_table(
             groups.append((k + 1, m, mean_pred, actual, roi))
         out[bt] = groups
     return out
+
+
+def run_trio_calibration(
+    cal_from: str, cal_to: str, test_from: str, test_to: str,
+    win_path: str, place_path: str, *,
+    source: str = "confirmed", samples: int | None = None,
+    er_grid: list[float] | None = None, prob_grid: list[float] | None = None,
+    show_progress: bool = True,
+):
+    """三連複の PL 確率を「較正期間の実頻度」で isotonic 較正 → test の trio グリッドを raw/較正で比較。
+
+    Harville(PL) は exotic で系統バイアスが出やすい。PL_prob→実的中 の単調変換を学習し、
+    EV=cal_prob×odds で選別し直すと trio ROI が改善するかを見る。返り (raw, cal, points, grids)。
+    """
+    er_grid = er_grid or [1.0, 1.1, 1.2, 1.3, 1.5, 2.0]
+    prob_grid = prob_grid or [0.0, 0.05, 0.10, 0.15]
+
+    # 1) 較正期間で trio を集め、PL確率→的中 の isotonic を学習（確定分のみ）
+    cal_settled = collect_settled_candidates(
+        cal_from, cal_to, win_path, place_path, source=source, samples=samples,
+        show_progress=show_progress, bet_types=("trio",))
+    probs = [t[2] for t in cal_settled if t[4]]
+    hits = [1 if t[5] else 0 for t in cal_settled if t[4]]
+    if len(probs) < 50:
+        raise RuntimeError(f"較正用 trio サンプルが少なすぎます (n={len(probs)})")
+    calib = fit_calibrator(probs, hits)
+
+    # 2) test 期間で trio を集める
+    test_settled = collect_settled_candidates(
+        test_from, test_to, win_path, place_path, source=source, samples=samples,
+        show_progress=show_progress, bet_types=("trio",))
+
+    # 3) raw と calibrated の trio グリッド（calibrated は prob/er を置換）
+    raw = sweep_roi(test_settled, er_grid, prob_grid)["trio"]
+    cal_test = []
+    for bt, _er, p, odds, st, hit, pay, sr, sl in test_settled:
+        cp = apply_calibrator([p], calib)[0]
+        cal_test.append((bt, cp * odds, cp, odds, st, hit, pay, sr, sl))
+    cal = sweep_roi(cal_test, er_grid, prob_grid)["trio"]
+
+    # 較正マッピングのサンプル点（生確率の分位 → 較正後）
+    sp = sorted(probs)
+    pts = []
+    for q in (0.5, 0.7, 0.9, 0.95, 0.99):
+        x = sp[min(len(sp) - 1, int(q * len(sp)))]
+        pts.append((x, apply_calibrator([x], calib)[0]))
+    return raw, cal, pts, er_grid, prob_grid
 
 
 def odds_band_roi(

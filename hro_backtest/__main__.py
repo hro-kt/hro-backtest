@@ -222,6 +222,34 @@ def _cmd_calib(args) -> int:
     return 0
 
 
+def _trio_grid(label, table, er_grid, prob_grid) -> None:
+    print(f"\n[trio {label}]  rows=min_er, cols=min_prob")
+    print("  min_er \\ min_prob | " + " | ".join(f"{p:>11.2f}" for p in prob_grid))
+    for er in er_grid:
+        cells = []
+        for p in prob_grid:
+            n, roi, _ = table[(er, p)]
+            cells.append(f"{('--' if roi is None else f'{roi:.3f}'):>6}({n:>4})" if n else f"{'--':>11}")
+        print(f"  {er:>16.2f} | " + " | ".join(cells))
+
+
+def _cmd_trio_calib(args) -> int:
+    from . import harness
+
+    raw, cal, pts, er_grid, prob_grid = harness.run_trio_calibration(
+        args.cal_from, args.cal_to, args.d_from, args.d_to, args.win_model, args.place_model,
+        source=args.source, samples=args.samples, show_progress=not args.no_progress,
+    )
+    print(f"\n=== Trio calibration  cal=[{args.cal_from}..{args.cal_to}] "
+          f"test=[{args.d_from}..{args.d_to}] source={args.source} ===")
+    print("  較正マッピング(生PL確率 → 較正後):")
+    for x, y in pts:
+        print(f"    {x:.4f} -> {y:.4f}")
+    _trio_grid("RAW", raw, er_grid, prob_grid)
+    _trio_grid("CALIBRATED", cal, er_grid, prob_grid)
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     parser = argparse.ArgumentParser(
@@ -284,6 +312,18 @@ def main(argv: list[str] | None = None) -> int:
     p_cal.add_argument("--no-progress", action="store_true")
     p_cal.add_argument("--out", type=Path, default=None, help="較正表を CSV 出力")
     p_cal.set_defaults(func=_cmd_calib)
+
+    p_tc = sub.add_parser("trio-calib", help="三連複: PL確率を実頻度で較正→test の trio ROI を raw/較正で比較")
+    p_tc.add_argument("--win-model", required=True)
+    p_tc.add_argument("--place-model", required=True)
+    p_tc.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
+    p_tc.add_argument("--samples", type=int, default=None)
+    p_tc.add_argument("--cal-from", required=True, help="較正期間 開始 YYYYMMDD(例 20240101)")
+    p_tc.add_argument("--cal-to", required=True, help="較正期間 終了 YYYYMMDD(例 20241231)")
+    p_tc.add_argument("--from", dest="d_from", required=True, help="test 開始 YYYYMMDD")
+    p_tc.add_argument("--to", dest="d_to", required=True, help="test 終了 YYYYMMDD")
+    p_tc.add_argument("--no-progress", action="store_true")
+    p_tc.set_defaults(func=_cmd_trio_calib)
 
     args = parser.parse_args(argv)
     return args.func(args)
