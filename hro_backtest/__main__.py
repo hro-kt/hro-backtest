@@ -36,6 +36,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--min-prob", type=float, default=None, help="的中確率の下限(既定0.05)")
     p.add_argument("--max-odds-age", type=float, default=None,
                    help="オッズ鮮度上限(秒)。未指定: confirmed=無制限 / live=60s")
+    p.add_argument("--trio-calib", default=None,
+                   help="券種別確率較正の JSON パス（fit-trio-calib 出力。EV 前に適用）")
 
 
 def _cmd_run(args) -> int:
@@ -52,6 +54,10 @@ def _cmd_run(args) -> int:
     money = MoneyManagerConfig()
     sim = SimConfig(n_samples=args.samples) if args.samples else SimConfig()
     kelly = KellyConfig(max_total=args.max_total) if args.max_total else KellyConfig()
+    calib = None
+    if args.trio_calib:
+        from hro_optimizer.calibration import load_calibrators
+        calib = load_calibrators(args.trio_calib)
 
     db = FeatureDB(load_features_config())
     conn = opt_connect()
@@ -60,6 +66,7 @@ def _cmd_run(args) -> int:
             db, conn, win_b, place_b, tuple(args.race),
             betting=betting, money=money, sim=sim, kelly=kelly,
             source=args.source, simultaneous=not args.independent_kelly,
+            prob_calibrators=calib,
         )
     finally:
         conn.close()
@@ -94,12 +101,16 @@ def _fmt(s) -> str:
 def _cmd_backtest(args) -> int:
     from . import harness
 
+    calib = None
+    if args.trio_calib:
+        from hro_optimizer.calibration import load_calibrators
+        calib = load_calibrators(args.trio_calib)
     res = harness.run_backtest(
         args.d_from, args.d_to, args.win_model, args.place_model,
         source=args.source, samples=args.samples, max_total=args.max_total,
         independent_kelly=args.independent_kelly, min_er=args.min_er,
         min_prob=args.min_prob, max_odds_age=args.max_odds_age, limit=args.limit,
-        show_progress=not args.no_progress,
+        show_progress=not args.no_progress, prob_calibrators=calib,
     )
     print(f"\n=== Backtest [{args.d_from}..{args.d_to}] source={args.source} ===")
     print(f"races={res.n_races} with_orders={res.n_races_with_orders}")
@@ -129,10 +140,14 @@ def _cmd_sweep(args) -> int:
     er_grid = _floats(args.er)
     prob_grid = _floats(args.prob)
     bet_types = tuple(x.strip() for x in args.bet_types.split(",") if x.strip())
+    calib = None
+    if args.trio_calib:
+        from hro_optimizer.calibration import load_calibrators
+        calib = load_calibrators(args.trio_calib)
     settled = harness.collect_settled_candidates(
         args.d_from, args.d_to, args.win_model, args.place_model,
         source=args.source, samples=args.samples, limit=args.limit,
-        show_progress=not args.no_progress, bet_types=bet_types,
+        show_progress=not args.no_progress, bet_types=bet_types, prob_calibrators=calib,
     )
     # セグメント絞り込み（少キャリア/休み明け＝市場情報が薄い土俵での検証）
     seg = ""
@@ -233,6 +248,24 @@ def _trio_grid(label, table, er_grid, prob_grid) -> None:
         print(f"  {er:>16.2f} | " + " | ".join(cells))
 
 
+def _cmd_fit_trio_calib(args) -> int:
+    import json
+
+    from . import harness
+
+    fit = harness.fit_trio_calibrator(
+        args.cal_from, args.cal_to, args.win_model, args.place_model,
+        source=args.source, samples=args.samples, show_progress=not args.no_progress,
+    )
+    out = {"trio": fit}
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(out, f, ensure_ascii=False, indent=2)
+    print(f"-> wrote trio calibrator to {args.out} "
+          f"(xs/ys points={len(fit.get('xs', []))})")
+    print("  本番に効かせる: sweep/backtest/run に --trio-calib でこのファイルを渡す。")
+    return 0
+
+
 def _cmd_trio_calib(args) -> int:
     from . import harness
 
@@ -290,6 +323,8 @@ def main(argv: list[str] | None = None) -> int:
                       help="オッズ帯分析の参照 min_er(既定1.0=ほぼ全候補)")
     p_sw.add_argument("--ref-prob", type=float, default=0.0,
                       help="オッズ帯分析の参照 min_prob(既定0.0)")
+    p_sw.add_argument("--trio-calib", default=None,
+                      help="券種別確率較正の JSON パス（fit-trio-calib 出力。EV 前に適用）")
     p_sw.add_argument("--max-career", type=int, default=None,
                       help="セグメント: 馬券の脚の最少キャリア本数(h_n_2y)がこれ以下のみ。少キャリア検証用")
     p_sw.add_argument("--min-layoff", type=int, default=None,
@@ -324,6 +359,17 @@ def main(argv: list[str] | None = None) -> int:
     p_tc.add_argument("--to", dest="d_to", required=True, help="test 終了 YYYYMMDD")
     p_tc.add_argument("--no-progress", action="store_true")
     p_tc.set_defaults(func=_cmd_trio_calib)
+
+    p_ft = sub.add_parser("fit-trio-calib", help="三連複較正器を学習して JSON 保存(本番 --trio-calib 用)")
+    p_ft.add_argument("--win-model", required=True)
+    p_ft.add_argument("--place-model", required=True)
+    p_ft.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
+    p_ft.add_argument("--samples", type=int, default=None)
+    p_ft.add_argument("--cal-from", required=True, help="較正期間 開始 YYYYMMDD")
+    p_ft.add_argument("--cal-to", required=True, help="較正期間 終了 YYYYMMDD")
+    p_ft.add_argument("--out", required=True, help="出力 JSON パス")
+    p_ft.add_argument("--no-progress", action="store_true")
+    p_ft.set_defaults(func=_cmd_fit_trio_calib)
 
     args = parser.parse_args(argv)
     return args.func(args)

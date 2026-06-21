@@ -82,7 +82,7 @@ def list_races(db: FeatureDB, d_from: str, d_to: str, limit: int | None = None) 
 def orders_for_race(
     db: FeatureDB, conn_odds, win_b: ModelBundle, place_b: ModelBundle, race: RaceKey, *,
     betting: BettingConfig, money: MoneyManagerConfig, sim: SimConfig, kelly: KellyConfig,
-    source: str, simultaneous: bool,
+    source: str, simultaneous: bool, prob_calibrators: dict | None = None,
 ) -> tuple[dict | None, list]:
     """1レース: 能力値→PL候補→資金配分。戻り (abilities_dict|None, BetOrder list)。"""
     rows = build_race_features(db, *race)
@@ -95,6 +95,7 @@ def orders_for_race(
     result = run_decide_pipeline(
         abilities, odds_lookup, betting, money,
         sim_config=sim, kelly_config=kelly, simultaneous=simultaneous,
+        prob_calibrators=prob_calibrators,
     )
     return abilities_dict, result.orders
 
@@ -132,7 +133,7 @@ def run_backtest(
     d_from: str, d_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None, max_total: float | None = None,
     independent_kelly: bool = False, min_er=None, min_prob=None, max_odds_age=None,
-    limit: int | None = None, show_progress: bool = True,
+    limit: int | None = None, show_progress: bool = True, prob_calibrators: dict | None = None,
 ) -> BacktestResult:
     """期間バックテスト: 各レースで bet を生成し、nl_hr 払戻と突合して ROI を出す。
 
@@ -162,6 +163,7 @@ def run_backtest(
                 db, conn_odds, win_b, place_b, race,
                 betting=betting, money=money, sim=sim, kelly=kelly,
                 source=source, simultaneous=not independent_kelly,
+                prob_calibrators=prob_calibrators,
             )
             if orders:
                 n_with += 1
@@ -210,7 +212,7 @@ def collect_settled_candidates(
     d_from: str, d_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None,
     limit: int | None = None, show_progress: bool = True,
-    bet_types: tuple[str, ...] | None = None,
+    bet_types: tuple[str, ...] | None = None, prob_calibrators: dict | None = None,
 ) -> list[tuple]:
     """全レースの「フィルタ前の全候補」を評価し、nl_hr で突合した結果を返す。
 
@@ -261,7 +263,8 @@ def collect_settled_candidates(
                     segmap[u] = (int(runs) if runs is not None else 0,
                                  int(lay) if lay is not None else 9999)
                 res = decide_race(ab, odds_lookup, permissive,
-                                  sim_config=sim, kelly_config=kelly, simultaneous=False)
+                                  sim_config=sim, kelly_config=kelly, simultaneous=False,
+                                  prob_calibrators=prob_calibrators)
                 if res.candidates:
                     idx, settled_races = build_payout_index(load_payout_rows(conn_hr, {race_id}))
                     for c in res.candidates:
@@ -374,6 +377,21 @@ def calibration_table(
             groups.append((k + 1, m, mean_pred, actual, roi))
         out[bt] = groups
     return out
+
+
+def fit_trio_calibrator(
+    cal_from: str, cal_to: str, win_path: str, place_path: str, *,
+    source: str = "confirmed", samples: int | None = None, show_progress: bool = True,
+) -> dict:
+    """較正期間の trio 候補から isotonic 較正器 {"xs","ys"} を学習して返す（保存用）。"""
+    cal_settled = collect_settled_candidates(
+        cal_from, cal_to, win_path, place_path, source=source, samples=samples,
+        show_progress=show_progress, bet_types=("trio",))
+    probs = [t[2] for t in cal_settled if t[4]]
+    hits = [1 if t[5] else 0 for t in cal_settled if t[4]]
+    if len(probs) < 50:
+        raise RuntimeError(f"較正用 trio サンプルが少なすぎます (n={len(probs)})")
+    return fit_calibrator(probs, hits)
 
 
 def run_trio_calibration(
