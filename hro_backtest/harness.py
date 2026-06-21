@@ -213,7 +213,8 @@ def collect_settled_candidates(
 ) -> list[tuple]:
     """全レースの「フィルタ前の全候補」を評価し、nl_hr で突合した結果を返す。
 
-    返り: list[(bet_type, expected_return, probability, odds, settled, hit, payout_per_100)]。
+    返り: list[(bet_type, er, probability, odds, settled, hit, payout_per_100, seg_runs, seg_layoff)]。
+    seg_runs=馬券の脚で最少のキャリア本数(h_n_2y), seg_layoff=最長の休養日数（セグメント検証用）。
     閾値(min_er/min_prob)に依らない重い処理(特徴/PL確率/突合)はここで1回だけ実施し、
     スイープはこのリストの filter+集計で行う（パイプラインを設定ごとに回さない）。
     フラット100円ベット前提（payout_per_100 がそのまま的中時の払戻）。
@@ -247,6 +248,17 @@ def collect_settled_candidates(
                 race_id = "".join(race)
                 ab = race_abilities_from_dict(score_abilities(rows, win_b, place_b, race_id))
                 odds_lookup = load_odds_lookup(conn_odds, race, source=source)
+                # セグメント属性（馬のキャリア本数=h_n_2y, 休養=days_since_prev）を馬番で引く
+                segmap: dict = {}
+                for r in rows:
+                    try:
+                        u = int(r.get("umaban"))
+                    except (TypeError, ValueError):
+                        continue
+                    runs = r.get("h_n_2y")
+                    lay = r.get("days_since_prev")
+                    segmap[u] = (int(runs) if runs is not None else 0,
+                                 int(lay) if lay is not None else 9999)
                 res = decide_race(ab, odds_lookup, permissive,
                                   sim_config=sim, kelly_config=kelly, simultaneous=False)
                 if res.candidates:
@@ -258,8 +270,16 @@ def collect_settled_candidates(
                                             mode="dry_run", status=STATUS_DRY_RUN, message="sweep"),
                             idx, settled_races,
                         )
+                        # 馬券の脚(複勝=1頭/ワイド2/三連複3)で、最少キャリア・最長休養を代表値に
+                        segs = [segmap.get(int(x)) for x in c.selection_id.split("-")
+                                if x.strip().isdigit()]
+                        if segs and all(g is not None for g in segs):
+                            seg_runs = min(g[0] for g in segs)
+                            seg_layoff = max(g[1] for g in segs)
+                        else:
+                            seg_runs, seg_layoff = None, None
                         out.append((c.bet_type, c.expected_return, c.probability,
-                                    c.odds, s.settled, s.hit, s.payout))
+                                    c.odds, s.settled, s.hit, s.payout, seg_runs, seg_layoff))
                         if s.settled:
                             run[0] += 100
                             run[1] += s.payout
@@ -300,7 +320,7 @@ def sweep_roi(
     for er in er_grid:
         for pr in prob_grid:
             acc = {t: [0, 0, 0, 0] for t in types}  # n, stake, payout, hits
-            for bt, e, p, odds, st, hit, pay in settled:
+            for bt, e, p, odds, st, hit, pay, _r, _l in settled:
                 if not st or e < er or p < pr:
                     continue
                 for key in ("ALL", bt):
@@ -331,7 +351,7 @@ def calibration_table(
     from collections import defaultdict
 
     by: dict[str, list] = defaultdict(list)
-    for bt, _er, prob, _odds, st, hit, pay in settled:
+    for bt, _er, prob, _odds, st, hit, pay, _r, _l in settled:
         if st:
             by[bt].append((prob, 1 if hit else 0, pay))
 
@@ -368,7 +388,7 @@ def odds_band_roi(
     types = ["ALL", "place", "wide", "trio"]
     acc = {t: {b: [0, 0, 0, 0] for b in bands} for t in types}
     last_hi = bands[-1][1] if bands else None
-    for bt, e, p, odds, st, hit, pay in settled:
+    for bt, e, p, odds, st, hit, pay, _r, _l in settled:
         if not st or e < ref_er or p < ref_prob:
             continue
         band = None

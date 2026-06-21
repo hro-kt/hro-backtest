@@ -134,9 +134,17 @@ def _cmd_sweep(args) -> int:
         source=args.source, samples=args.samples, limit=args.limit,
         show_progress=not args.no_progress, bet_types=bet_types,
     )
+    # セグメント絞り込み（少キャリア/休み明け＝市場情報が薄い土俵での検証）
+    seg = ""
+    if args.max_career is not None:
+        settled = [t for t in settled if t[7] is not None and t[7] <= args.max_career]
+        seg += f" career<={args.max_career}"
+    if args.min_layoff is not None:
+        settled = [t for t in settled if t[8] is not None and t[8] >= args.min_layoff]
+        seg += f" layoff>={args.min_layoff}d"
     table = harness.sweep_roi(settled, er_grid, prob_grid)
 
-    print(f"\n=== Sweep [{args.d_from}..{args.d_to}] source={args.source} "
+    print(f"\n=== Sweep [{args.d_from}..{args.d_to}] source={args.source}{seg} "
           f"(flat ¥100/bet, ROI=payout/stake; cell='ROI(n)') ===")
     for t in ("ALL", "place", "wide", "trio"):
         print(f"\n[{t}]  rows=min_er, cols=min_prob")
@@ -254,6 +262,10 @@ def main(argv: list[str] | None = None) -> int:
                       help="オッズ帯分析の参照 min_er(既定1.0=ほぼ全候補)")
     p_sw.add_argument("--ref-prob", type=float, default=0.0,
                       help="オッズ帯分析の参照 min_prob(既定0.0)")
+    p_sw.add_argument("--max-career", type=int, default=None,
+                      help="セグメント: 馬券の脚の最少キャリア本数(h_n_2y)がこれ以下のみ。少キャリア検証用")
+    p_sw.add_argument("--min-layoff", type=int, default=None,
+                      help="セグメント: 最長休養日数がこれ以上のみ。休み明け検証用(新馬=9999)")
     p_sw.add_argument("--no-progress", action="store_true")
     p_sw.add_argument("--out", type=Path, default=None, help="全グリッドを CSV 出力")
     p_sw.set_defaults(func=_cmd_sweep)
