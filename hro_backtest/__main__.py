@@ -283,6 +283,32 @@ def _cmd_trio_calib(args) -> int:
     return 0
 
 
+def _cmd_pair_correct(args) -> int:
+    from . import harness
+
+    r = harness.run_pair_correction(
+        args.cal_from, args.cal_to, args.d_from, args.d_to, args.win_model, args.place_model,
+        source=args.source, samples=args.samples, show_progress=not args.no_progress,
+    )
+    print(f"\n=== Pair correction (wide)  cal=[{args.cal_from}..{args.cal_to}] "
+          f"test=[{args.d_from}..{args.d_to}] source={args.source} ===")
+    print(f"  n_cal={r['n_cal']}  n_test={r['n_test']}")
+    print(f"  logloss  baseline(PL)={r['logloss_baseline']:.5f}  "
+          f"model(PL+pair)={r['logloss_model']:.5f}  "
+          f"lift={r['logloss_lift']:+.5f}  (>0=ペア特徴がPLを改善)")
+    print("\n  特徴重要度(gain, 上位10):")
+    for name, g in r["importance"][:10]:
+        print(f"    {name:<20} {g:>12.1f}")
+    print("\n  wide ROI: min_er | RAW(PL)  | CORRECTED(model)   cell=ROI(n)")
+    for er in r["er_grid"]:
+        nr, ror, _ = r["roi_raw"][er]
+        nc, roc, _ = r["roi_corrected"][er]
+        sr = "--" if ror is None else f"{ror:.3f}"
+        sc = "--" if roc is None else f"{roc:.3f}"
+        print(f"    {er:>5.2f}  | {sr}({nr:>5}) | {sc}({nc:>5})")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     parser = argparse.ArgumentParser(
@@ -370,6 +396,19 @@ def main(argv: list[str] | None = None) -> int:
     p_ft.add_argument("--out", required=True, help="出力 JSON パス")
     p_ft.add_argument("--no-progress", action="store_true")
     p_ft.set_defaults(func=_cmd_fit_trio_calib)
+
+    p_pc = sub.add_parser("pair-correct",
+                          help="ペア相関補正(wide): PL残差をペア特徴で学習し PL と logloss/ROI 比較")
+    p_pc.add_argument("--win-model", required=True)
+    p_pc.add_argument("--place-model", required=True)
+    p_pc.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
+    p_pc.add_argument("--samples", type=int, default=None)
+    p_pc.add_argument("--cal-from", required=True, help="学習期間 開始 YYYYMMDD")
+    p_pc.add_argument("--cal-to", required=True, help="学習期間 終了 YYYYMMDD")
+    p_pc.add_argument("--from", dest="d_from", required=True, help="test 開始 YYYYMMDD")
+    p_pc.add_argument("--to", dest="d_to", required=True, help="test 終了 YYYYMMDD")
+    p_pc.add_argument("--no-progress", action="store_true")
+    p_pc.set_defaults(func=_cmd_pair_correct)
 
     args = parser.parse_args(argv)
     return args.func(args)

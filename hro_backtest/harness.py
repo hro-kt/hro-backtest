@@ -480,3 +480,215 @@ def odds_band_roi(
             table[t][b] = (n, (payout / stake) if stake else None, (hits / n) if n else None)
     return table, bands
 
+
+# =============================================================================
+# ペア相関補正層（③）: PL のペア共起確率(q_PL) と実頻度の差を、ペア特徴で残差学習。
+#   wide(=上位3頭中2頭) を直接ターゲットに、PL が表現できない「組の相性」を補正する。
+#   logit(q_PL) を特徴に入れる＝モデルは PL からの残差だけ学べばよい（無相関なら係数≈0）。
+# =============================================================================
+
+# 抽出するペア特徴の名前（順序固定。値は _pair_features が同順で返す）。
+PAIR_FEATURE_NAMES = [
+    "logit_qpl",                              # PL のペア共起確率(ロジット)＝ベースライン
+    "pass_min", "pass_max", "pass_gap", "pass_sum",   # 脚質(通過率): 小=前。両前傾/前差混在
+    "front_min", "front_max", "front_sum",            # 先行率: 両逃げ→共倒れ仮説
+    "spd_min", "spd_max", "spd_gap",                  # 補正スピード指数(能力)
+    "spdz_min", "spdz_max",                           # 同 レース内z
+    "rentai_min", "rentai_max",                       # 連対率(1y)
+    "rank_pass_sum", "rank_pass_max",                 # 想定隊列順位ペア（前に行く順）
+    "race_front_count", "race_front_density", "field_size",  # ペース文脈（レース共通）
+]
+
+
+def _num(r: dict, k: str) -> float:
+    v = r.get(k)
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _pair_features(ri: dict, rj: dict, q_pl: float) -> list[float]:
+    """2頭の特徴行から、順序非依存(min/max/sum/gap)のペア特徴ベクトルを作る。"""
+    import math as _m
+
+    q = min(max(q_pl, 1e-6), 1 - 1e-6)
+    logit = _m.log(q / (1 - q))
+
+    def mm(k):
+        a, b = _num(ri, k), _num(rj, k)
+        return a, b
+
+    pa, pb = mm("h_pass_ratio_6m")
+    fa, fb = mm("h_front_rate_6m")
+    sa, sb = mm("h_speedidx_adj_6m")
+    za, zb = mm("h_speedidx_adj_6m_z")
+    ra, rb = mm("h_rentai_1y")
+    ka, kb = mm("h_pass_ratio_6m_rank")
+    return [
+        logit,
+        min(pa, pb), max(pa, pb), abs(pa - pb), pa + pb,
+        min(fa, fb), max(fa, fb), fa + fb,
+        min(sa, sb), max(sa, sb), abs(sa - sb),
+        min(za, zb), max(za, zb),
+        min(ra, rb), max(ra, rb),
+        ka + kb, max(ka, kb),
+        _num(ri, "race_front_count"), _num(ri, "race_front_density"), _num(ri, "field_size"),
+    ]
+
+
+def collect_pair_samples(
+    d_from: str, d_to: str, win_path: str, place_path: str, *,
+    source: str = "confirmed", samples: int | None = None,
+    limit: int | None = None, show_progress: bool = True,
+) -> list[tuple]:
+    """各レースの wide 全候補について (特徴ベクトル, q_PL, odds, settled, hit) を抽出。
+
+    collect_settled_candidates と同じ評価パスだが、候補ごとに rows(特徴) を引いて
+    ペア特徴を作る点が違う。フラット100円ベット前提（payout は的中時の払戻）。
+    """
+    import psycopg
+
+    win_b, place_b = load_models(win_path, place_path)
+    d = BettingConfig()
+    age = float("inf") if source == "confirmed" else d.max_odds_age_seconds
+    permissive = BettingConfig(min_expected_return=0.0, min_probability=0.0,
+                               max_odds_age_seconds=age, allowed_bet_types=("wide",))
+    sim = SimConfig(n_samples=samples) if samples else SimConfig()
+    kelly = KellyConfig()
+
+    db = FeatureDB(load_features_config())
+    conn_odds = opt_connect()
+    conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
+    out: list[tuple] = []
+    run = [0, 0]  # staked, payout（走行中ROI表示）
+    races = list_races(db, d_from, d_to, limit=limit)
+    bar = _progress_bar(len(races), show_progress)
+    try:
+        for i, race in enumerate(races, 1):
+            rows = build_race_features(db, *race)
+            if rows:
+                race_id = "".join(race)
+                ab = race_abilities_from_dict(score_abilities(rows, win_b, place_b, race_id))
+                odds_lookup = load_odds_lookup(conn_odds, race, source=source)
+                umap: dict = {}
+                for r in rows:
+                    try:
+                        umap[int(r.get("umaban"))] = r
+                    except (TypeError, ValueError):
+                        continue
+                res = decide_race(ab, odds_lookup, permissive,
+                                  sim_config=sim, kelly_config=kelly, simultaneous=False)
+                if res.candidates:
+                    idx, settled_races = build_payout_index(load_payout_rows(conn_hr, {race_id}))
+                    for c in res.candidates:
+                        legs = [int(x) for x in c.selection_id.split("-") if x.strip().isdigit()]
+                        if len(legs) != 2 or legs[0] not in umap or legs[1] not in umap:
+                            continue
+                        s = settle_result(
+                            ExecutionResult(race_id=c.race_id, selection_id=c.selection_id,
+                                            bet_type=c.bet_type, amount=100, odds=c.odds,
+                                            mode="dry_run", status=STATUS_DRY_RUN, message="pair"),
+                            idx, settled_races,
+                        )
+                        feats = _pair_features(umap[legs[0]], umap[legs[1]], c.probability)
+                        out.append((feats, c.probability, c.odds, s.settled,
+                                    1 if s.hit else 0, s.payout))
+                        if s.settled:
+                            run[0] += 100
+                            run[1] += s.payout
+            if bar is not None:
+                bar.update(1)
+                roi = (run[1] / run[0]) if run[0] else None
+                bar.set_postfix(pairs=len(out), ROI=("--" if roi is None else f"{roi:.3f}"))
+    finally:
+        if bar is not None:
+            bar.close()
+        conn_hr.close()
+        conn_odds.close()
+        db.close()
+    return out
+
+
+def _logloss(probs: list[float], ys: list[int]) -> float:
+    import math as _m
+    n = len(ys)
+    if n == 0:
+        return float("nan")
+    s = 0.0
+    for p, y in zip(probs, ys):
+        q = min(max(p, 1e-9), 1 - 1e-9)
+        s += -(y * _m.log(q) + (1 - y) * _m.log(1 - q))
+    return s / n
+
+
+def _roi_by_er(samples: list[tuple], preds: list[float], er_grid: list[float]) -> dict:
+    """各 EV 閾値で、preds×odds>=er の wide を選んだときの (n, roi, hit)。settled のみ。"""
+    res = {}
+    for er in er_grid:
+        n = stake = payout = hits = 0
+        for (feats, q, odds, st, hit, pay), pr in zip(samples, preds):
+            if not st or pr * odds < er:
+                continue
+            n += 1
+            stake += 100
+            payout += pay
+            hits += hit
+        res[er] = (n, (payout / stake) if stake else None, (hits / n) if n else None)
+    return res
+
+
+def run_pair_correction(
+    cal_from: str, cal_to: str, test_from: str, test_to: str,
+    win_path: str, place_path: str, *,
+    source: str = "confirmed", samples: int | None = None,
+    er_grid: list[float] | None = None, show_progress: bool = True,
+):
+    """ペア相関補正の学習＋評価。cal で残差モデルを学習、test で PL と比較。
+
+    返り: dict（test logloss baseline/model, 特徴重要度, raw/corrected の wide ROI）。
+    リフト（baseline logloss − model logloss）が ~0 なら「PL を超えるペア相関は無い」
+    と読める（=内蔵診断）。プラスかつ corrected ROI が raw を上回れば本番統合の価値あり。
+    """
+    import numpy as np
+    import lightgbm as lgb
+
+    er_grid = er_grid or [1.0, 1.1, 1.2, 1.3, 1.5]
+
+    cal = collect_pair_samples(cal_from, cal_to, win_path, place_path,
+                               source=source, samples=samples, show_progress=show_progress)
+    cal_s = [t for t in cal if t[3]]  # settled のみ学習に使う
+    if len(cal_s) < 200:
+        raise RuntimeError(f"学習用 wide ペアが少なすぎます (n={len(cal_s)})")
+    Xtr = np.asarray([t[0] for t in cal_s], dtype="float32")
+    ytr = np.asarray([t[4] for t in cal_s], dtype="float32")
+
+    # 過学習を抑えた小さめの設定（ペア特徴は少数・信号も小さい想定）。
+    params = dict(objective="binary", learning_rate=0.03, num_leaves=15,
+                  min_child_samples=200, feature_fraction=0.8, bagging_fraction=0.8,
+                  bagging_freq=1, verbose=-1)
+    dtr = lgb.Dataset(Xtr, label=ytr, feature_name=list(PAIR_FEATURE_NAMES))
+    booster = lgb.train(params, dtr, num_boost_round=300)
+
+    test = collect_pair_samples(test_from, test_to, win_path, place_path,
+                                source=source, samples=samples, show_progress=show_progress)
+    test_s = [t for t in test if t[3]]
+    Xte = np.asarray([t[0] for t in test_s], dtype="float32")
+    yte = [int(t[4]) for t in test_s]
+    q_pl = [t[1] for t in test_s]                       # PL ベースライン確率
+    model_p = list(booster.predict(Xte))                # 補正後確率
+
+    ll_base = _logloss(q_pl, yte)
+    ll_model = _logloss(model_p, yte)
+    imp = sorted(zip(PAIR_FEATURE_NAMES, booster.feature_importance(importance_type="gain")),
+                 key=lambda x: -x[1])
+    roi_raw = _roi_by_er(test_s, q_pl, er_grid)
+    roi_cor = _roi_by_er(test_s, model_p, er_grid)
+    return {
+        "n_cal": len(cal_s), "n_test": len(test_s),
+        "logloss_baseline": ll_base, "logloss_model": ll_model,
+        "logloss_lift": ll_base - ll_model,
+        "importance": imp, "roi_raw": roi_raw, "roi_corrected": roi_cor,
+        "er_grid": er_grid,
+    }
+
