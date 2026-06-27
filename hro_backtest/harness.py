@@ -240,6 +240,7 @@ def collect_settled_candidates(
     bt_kw = {"allowed_bet_types": tuple(bet_types)} if bet_types else {}
     if max_odds is not None:
         bt_kw["max_odds"] = max_odds
+    want_st = bool(bet_types) and "sanrentan" in bet_types  # 三連単オッズ(nl_o6)は要求時のみ読む
     permissive = BettingConfig(min_expected_return=0.0, min_probability=0.0,
                                max_odds_age_seconds=age, **bt_kw)
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
@@ -260,7 +261,8 @@ def collect_settled_candidates(
             if rows:
                 race_id = "".join(race)
                 ab = race_abilities_from_dict(score_abilities(rows, win_b, place_b, race_id))
-                odds_lookup = load_odds_lookup(conn_odds, race, source=source)
+                odds_lookup = load_odds_lookup(conn_odds, race, source=source,
+                                               want_sanrentan=want_st)
                 # セグメント属性（馬のキャリア本数=h_n_2y, 休養=days_since_prev）を馬番で引く
                 segmap: dict = {}
                 for r in rows:
@@ -329,7 +331,7 @@ def sweep_roi(
     返り: {bet_type or 'ALL': {(er, prob): (n, roi, hit_rate)}}。
     roi = 払戻合計 / 投資合計、hit_rate = 的中 / ベット数（確定分のみ）。
     """
-    types = ["ALL", "place", "wide", "trio"]
+    types = ["ALL", "place", "wide", "trio", "sanrentan"]
     table: dict[str, dict] = {t: {} for t in types}
     for er in er_grid:
         for pr in prob_grid:
@@ -461,7 +463,7 @@ def odds_band_roi(
     返り: ({bet_type: {(lo,hi): (n, roi, hit_rate)}}, bands)。
     """
     bands = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
-    types = ["ALL", "place", "wide", "trio"]
+    types = ["ALL", "place", "wide", "trio", "sanrentan"]
     acc = {t: {b: [0, 0, 0, 0] for b in bands} for t in types}
     last_hi = bands[-1][1] if bands else None
     for bt, e, p, odds, st, hit, pay, _r, _l in settled:

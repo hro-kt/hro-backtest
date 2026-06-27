@@ -164,7 +164,7 @@ def _cmd_sweep(args) -> int:
 
     print(f"\n=== Sweep [{args.d_from}..{args.d_to}] source={args.source}{seg} "
           f"(flat ¥100/bet, ROI=payout/stake; cell='ROI(n)') ===")
-    for t in ("ALL", "place", "wide", "trio"):
+    for t in ("ALL", "place", "wide", "trio", "sanrentan"):
         print(f"\n[{t}]  rows=min_er, cols=min_prob")
         print("  min_er \\ min_prob | " + " | ".join(f"{p:>11.2f}" for p in prob_grid))
         for er in er_grid:
@@ -178,7 +178,7 @@ def _cmd_sweep(args) -> int:
     cuts = _floats(args.odds_bands)
     ob, bands = harness.odds_band_roi(settled, cuts, ref_er=args.ref_er, ref_prob=args.ref_prob)
     print(f"\n=== Odds-band ROI  (ref: min_er>={args.ref_er}, min_prob>={args.ref_prob}; cell='ROI(n)') ===")
-    for t in ("ALL", "place", "wide", "trio"):
+    for t in ("ALL", "place", "wide", "trio", "sanrentan"):
         print(f"\n[{t}]")
         print("  band | " + " | ".join(f"{lo:g}-{hi:g}".rjust(12) for lo, hi in bands))
         cells = []
