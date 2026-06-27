@@ -34,6 +34,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
     p.add_argument("--independent-kelly", action="store_true", help="各馬券独立フルケリー")
     p.add_argument("--min-er", type=float, default=None, help="期待値の下限(既定1.1)")
     p.add_argument("--min-prob", type=float, default=None, help="的中確率の下限(既定0.05)")
+    p.add_argument("--max-odds", type=float, default=None,
+                   help="オッズ上限(既定50)。三連単/高配当ゾーンを狙うとき引き上げる(例 2000)")
     p.add_argument("--max-odds-age", type=float, default=None,
                    help="オッズ鮮度上限(秒)。未指定: confirmed=無制限 / live=60s")
     p.add_argument("--trio-calib", default=None,
@@ -109,8 +111,8 @@ def _cmd_backtest(args) -> int:
         args.d_from, args.d_to, args.win_model, args.place_model,
         source=args.source, samples=args.samples, max_total=args.max_total,
         independent_kelly=args.independent_kelly, min_er=args.min_er,
-        min_prob=args.min_prob, max_odds_age=args.max_odds_age, limit=args.limit,
-        show_progress=not args.no_progress, prob_calibrators=calib,
+        min_prob=args.min_prob, max_odds_age=args.max_odds_age, max_odds=args.max_odds,
+        limit=args.limit, show_progress=not args.no_progress, prob_calibrators=calib,
     )
     print(f"\n=== Backtest [{args.d_from}..{args.d_to}] source={args.source} ===")
     print(f"races={res.n_races} with_orders={res.n_races_with_orders}")
@@ -148,6 +150,7 @@ def _cmd_sweep(args) -> int:
         args.d_from, args.d_to, args.win_model, args.place_model,
         source=args.source, samples=args.samples, limit=args.limit,
         show_progress=not args.no_progress, bet_types=bet_types, prob_calibrators=calib,
+        max_odds=args.max_odds,
     )
     # セグメント絞り込み（少キャリア/休み明け＝市場情報が薄い土俵での検証）
     seg = ""
@@ -343,7 +346,9 @@ def main(argv: list[str] | None = None) -> int:
                       help="min_prob グリッド(カンマ区切り)")
     p_sw.add_argument("--bet-types", default="place,wide",
                       help="評価する券種(カンマ区切り)。trio はノイズかつ高コストなので既定で除外")
-    p_sw.add_argument("--odds-bands", default="1.5,3,6,12,25,50",
+    p_sw.add_argument("--max-odds", type=float, default=None,
+                      help="オッズ上限(既定50)。三連単/高配当を狙うとき引き上げる(例 2000)")
+    p_sw.add_argument("--odds-bands", default="1.5,3,6,12,25,50,100,300,1000",
                       help="オッズ帯の区切り(カンマ区切り)。人気-穴バイアス検証用")
     p_sw.add_argument("--ref-er", type=float, default=1.0,
                       help="オッズ帯分析の参照 min_er(既定1.0=ほぼ全候補)")

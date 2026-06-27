@@ -39,8 +39,12 @@ from hro_buyer.settlement import build_payout_index, settle_result, settle_resul
 RaceKey = tuple[str, str, str, str, str, str]
 
 
-def betting_config(source: str, *, min_er=None, min_prob=None, max_odds_age=None) -> BettingConfig:
-    """confirmed は鮮度ガード無制限を既定に（確定オッズは鮮度概念なし）。閾値は任意で上書き。"""
+def betting_config(source: str, *, min_er=None, min_prob=None, max_odds_age=None,
+                   max_odds=None) -> BettingConfig:
+    """confirmed は鮮度ガード無制限を既定に（確定オッズは鮮度概念なし）。閾値は任意で上書き。
+
+    max_odds: オッズ上限（既定 50）。三連単/高配当ゾーンを狙うときに引き上げる。
+    """
     d = BettingConfig()
     age = max_odds_age
     if age is None:
@@ -49,6 +53,7 @@ def betting_config(source: str, *, min_er=None, min_prob=None, max_odds_age=None
         min_expected_return=(min_er if min_er is not None else d.min_expected_return),
         min_probability=(min_prob if min_prob is not None else d.min_probability),
         max_odds_age_seconds=age,
+        max_odds=(max_odds if max_odds is not None else d.max_odds),
     )
 
 
@@ -133,6 +138,7 @@ def run_backtest(
     d_from: str, d_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None, max_total: float | None = None,
     independent_kelly: bool = False, min_er=None, min_prob=None, max_odds_age=None,
+    max_odds=None,
     limit: int | None = None, show_progress: bool = True, prob_calibrators: dict | None = None,
 ) -> BacktestResult:
     """期間バックテスト: 各レースで bet を生成し、nl_hr 払戻と突合して ROI を出す。
@@ -141,7 +147,8 @@ def run_backtest(
     show_progress=True で tqdm 進捗バー(未導入時は 100 レース毎に stderr へログ)。
     """
     win_b, place_b = load_models(win_path, place_path)
-    betting = betting_config(source, min_er=min_er, min_prob=min_prob, max_odds_age=max_odds_age)
+    betting = betting_config(source, min_er=min_er, min_prob=min_prob,
+                             max_odds_age=max_odds_age, max_odds=max_odds)
     money = MoneyManagerConfig()
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
     kelly = KellyConfig(max_total=max_total) if max_total else KellyConfig()
@@ -213,6 +220,7 @@ def collect_settled_candidates(
     source: str = "confirmed", samples: int | None = None,
     limit: int | None = None, show_progress: bool = True,
     bet_types: tuple[str, ...] | None = None, prob_calibrators: dict | None = None,
+    max_odds: float | None = None,
 ) -> list[tuple]:
     """全レースの「フィルタ前の全候補」を評価し、nl_hr で突合した結果を返す。
 
@@ -230,6 +238,8 @@ def collect_settled_candidates(
     age = float("inf") if source == "confirmed" else d.max_odds_age_seconds
     # しきい値は無効化（min_er/min_prob=0）。odds 範囲は通常ポリシー(1.5..50)を維持。
     bt_kw = {"allowed_bet_types": tuple(bet_types)} if bet_types else {}
+    if max_odds is not None:
+        bt_kw["max_odds"] = max_odds
     permissive = BettingConfig(min_expected_return=0.0, min_probability=0.0,
                                max_odds_age_seconds=age, **bt_kw)
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
