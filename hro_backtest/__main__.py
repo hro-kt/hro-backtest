@@ -136,6 +136,30 @@ def _floats(s: str) -> list[float]:
     return [float(x) for x in s.split(",") if x.strip() != ""]
 
 
+def _write_candidates(path: str, settled: list) -> None:
+    """collect 結果(候補リスト)を CSV 保存。再スライス(grid/ref/帯変更)を collect 無しで即実行するため。"""
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(["bet_type", "er", "prob", "odds", "settled", "hit", "payout",
+                    "seg_runs", "seg_layoff"])
+        for t in settled:
+            w.writerow(t)
+
+
+def _read_candidates(path: str) -> list[tuple]:
+    out: list[tuple] = []
+    with open(path, encoding="utf-8") as f:
+        r = csv.reader(f)
+        next(r, None)
+        for row in r:
+            bt, er, prob, odds, st, hit, pay, sr, sl = row
+            out.append((bt, float(er), float(prob), float(odds),
+                        st == "True", hit == "True", int(pay),
+                        (int(sr) if sr not in ("", "None") else None),
+                        (int(sl) if sl not in ("", "None") else None)))
+    return out
+
+
 def _cmd_sweep(args) -> int:
     from . import harness
 
@@ -146,12 +170,22 @@ def _cmd_sweep(args) -> int:
     if args.trio_calib:
         from hro_optimizer.calibration import load_calibrators
         calib = load_calibrators(args.trio_calib)
-    settled = harness.collect_settled_candidates(
-        args.d_from, args.d_to, args.win_model, args.place_model,
-        source=args.source, samples=args.samples, limit=args.limit,
-        show_progress=not args.no_progress, bet_types=bet_types, prob_calibrators=calib,
-        max_odds=args.max_odds,
-    )
+    if args.load_candidates:
+        settled = _read_candidates(args.load_candidates)
+        print(f"loaded {len(settled)} candidates from {args.load_candidates} (collect 省略)")
+    else:
+        if not (args.win_model and args.place_model and args.d_from and args.d_to):
+            raise SystemExit("collect には --win-model/--place-model/--from/--to が必須"
+                             "（再スライスのみなら --load-candidates を使用）")
+        settled = harness.collect_settled_candidates(
+            args.d_from, args.d_to, args.win_model, args.place_model,
+            source=args.source, samples=args.samples, limit=args.limit,
+            show_progress=not args.no_progress, bet_types=bet_types, prob_calibrators=calib,
+            max_odds=args.max_odds,
+        )
+        if args.save_candidates:
+            _write_candidates(args.save_candidates, settled)
+            print(f"saved {len(settled)} candidates to {args.save_candidates}")
     # セグメント絞り込み（少キャリア/休み明け＝市場情報が薄い土俵での検証）
     seg = ""
     if args.max_career is not None:
@@ -334,12 +368,12 @@ def main(argv: list[str] | None = None) -> int:
     p_bt.set_defaults(func=_cmd_backtest)
 
     p_sw = sub.add_parser("sweep", help="min_er×min_prob のグリッドで ROI を一括比較(フラット¥100)")
-    p_sw.add_argument("--win-model", required=True)
-    p_sw.add_argument("--place-model", required=True)
+    p_sw.add_argument("--win-model", default=None, help="--load-candidates 時は不要")
+    p_sw.add_argument("--place-model", default=None, help="--load-candidates 時は不要")
     p_sw.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
     p_sw.add_argument("--samples", type=int, default=None, help="PL モンテカルロのサンプル数")
-    p_sw.add_argument("--from", dest="d_from", required=True, help="YYYYMMDD")
-    p_sw.add_argument("--to", dest="d_to", required=True, help="YYYYMMDD")
+    p_sw.add_argument("--from", dest="d_from", default=None, help="YYYYMMDD（--load-candidates 時は不要）")
+    p_sw.add_argument("--to", dest="d_to", default=None, help="YYYYMMDD（--load-candidates 時は不要）")
     p_sw.add_argument("--limit", type=int, default=None, help="先頭 N レースだけ")
     p_sw.add_argument("--er", default="1.0,1.1,1.2,1.3,1.5,2.0", help="min_er グリッド(カンマ区切り)")
     p_sw.add_argument("--prob", default="0.0,0.05,0.10,0.15,0.20,0.25",
@@ -362,6 +396,10 @@ def main(argv: list[str] | None = None) -> int:
                       help="セグメント: 最長休養日数がこれ以上のみ。休み明け検証用(新馬=9999)")
     p_sw.add_argument("--no-progress", action="store_true")
     p_sw.add_argument("--out", type=Path, default=None, help="全グリッドを CSV 出力")
+    p_sw.add_argument("--save-candidates", default=None,
+                      help="collect 結果(候補)を CSV 保存。後で --load-candidates で即再スライス")
+    p_sw.add_argument("--load-candidates", default=None,
+                      help="保存済み候補 CSV から読む（collect を省略＝grid/ref/帯の再スライスが一瞬）")
     p_sw.set_defaults(func=_cmd_sweep)
 
     p_cal = sub.add_parser("calib", help="較正診断: モデル確率 vs 実的中率(デシル別)")
