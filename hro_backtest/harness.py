@@ -331,7 +331,7 @@ def sweep_roi(
     返り: {bet_type or 'ALL': {(er, prob): (n, roi, hit_rate)}}。
     roi = 払戻合計 / 投資合計、hit_rate = 的中 / ベット数（確定分のみ）。
     """
-    types = ["ALL", "place", "wide", "trio", "sanrentan"]
+    types = ["ALL", "win", "place", "wide", "trio", "sanrentan"]
     table: dict[str, dict] = {t: {} for t in types}
     for er in er_grid:
         for pr in prob_grid:
@@ -463,7 +463,7 @@ def odds_band_roi(
     返り: ({bet_type: {(lo,hi): (n, roi, hit_rate)}}, bands)。
     """
     bands = [(cuts[i], cuts[i + 1]) for i in range(len(cuts) - 1)]
-    types = ["ALL", "place", "wide", "trio", "sanrentan"]
+    types = ["ALL", "win", "place", "wide", "trio", "sanrentan"]
     acc = {t: {b: [0, 0, 0, 0] for b in bands} for t in types}
     last_hi = bands[-1][1] if bands else None
     for bt, e, p, odds, st, hit, pay, _r, _l in settled:

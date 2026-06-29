@@ -198,7 +198,7 @@ def _cmd_sweep(args) -> int:
 
     print(f"\n=== Sweep [{args.d_from}..{args.d_to}] source={args.source}{seg} "
           f"(flat ¥100/bet, ROI=payout/stake; cell='ROI(n)') ===")
-    for t in ("ALL", "place", "wide", "trio", "sanrentan"):
+    for t in ("ALL", "win", "place", "wide", "trio", "sanrentan"):
         print(f"\n[{t}]  rows=min_er, cols=min_prob")
         print("  min_er \\ min_prob | " + " | ".join(f"{p:>11.2f}" for p in prob_grid))
         for er in er_grid:
@@ -212,7 +212,7 @@ def _cmd_sweep(args) -> int:
     cuts = _floats(args.odds_bands)
     ob, bands = harness.odds_band_roi(settled, cuts, ref_er=args.ref_er, ref_prob=args.ref_prob)
     print(f"\n=== Odds-band ROI  (ref: min_er>={args.ref_er}, min_prob>={args.ref_prob}; cell='ROI(n)') ===")
-    for t in ("ALL", "place", "wide", "trio", "sanrentan"):
+    for t in ("ALL", "win", "place", "wide", "trio", "sanrentan"):
         print(f"\n[{t}]")
         print("  band | " + " | ".join(f"{lo:g}-{hi:g}".rjust(12) for lo, hi in bands))
         cells = []
@@ -346,6 +346,68 @@ def _cmd_pair_correct(args) -> int:
     return 0
 
 
+def _spearman(xs: list[float], ys: list[float]) -> float | None:
+    """順位相関（scipy 不使用）。欠損ペアは除外。"""
+    pairs = [(x, y) for x, y in zip(xs, ys) if x is not None and y is not None]
+    if len(pairs) < 3:
+        return None
+
+    def _ranks(vs):
+        order = sorted(range(len(vs)), key=lambda i: vs[i])
+        rk = [0.0] * len(vs)
+        for r, i in enumerate(order):
+            rk[i] = r
+        return rk
+    rx, ry = _ranks([p[0] for p in pairs]), _ranks([p[1] for p in pairs])
+    n = len(pairs)
+    mx, my = sum(rx) / n, sum(ry) / n
+    cov = sum((a - mx) * (b - my) for a, b in zip(rx, ry))
+    vx = sum((a - mx) ** 2 for a in rx) ** 0.5
+    vy = sum((b - my) ** 2 for b in ry) ** 0.5
+    return (cov / (vx * vy)) if vx and vy else None
+
+
+def _cmd_metric_roi(args) -> int:
+    from . import harness
+    from hro_predictor.bundle import ModelBundle
+
+    win_models = [x.strip() for x in args.win_models.split(",") if x.strip()]
+    rows: list[dict] = []
+    print(f"\n{'config':10s} {'auc':>7s} {'logloss':>8s} {'top1':>7s} {'top3':>7s} "
+          f"{'ROI':>7s} {'n':>6s}")
+    for wm in win_models:
+        mt = ModelBundle.load(wm).meta.metrics.get("test", {})
+        cfgname = ModelBundle.load(wm).meta.metrics.get("hpo_config", wm.split("/")[-1])
+        settled = harness.collect_settled_candidates(
+            args.d_from, args.d_to, wm, args.place_model,
+            source=args.source, samples=args.samples, bet_types=("win",),
+            max_odds=args.max_odds, show_progress=not args.no_progress,
+        )
+        stake = payout = n = 0
+        for bt, er, prob, odds, st, hit, pay, _r, _l in settled:
+            if not st or er < args.min_er or prob < args.min_prob:
+                continue
+            n += 1
+            stake += 100
+            payout += pay
+        roi = (payout / stake) if stake else None
+        row = {"name": cfgname, "auc": mt.get("auc"), "logloss": mt.get("logloss"),
+               "top1": mt.get("race_top1_hit"), "top3": mt.get("race_top3_hit"),
+               "roi": roi, "n": n}
+        rows.append(row)
+        sr = "--" if roi is None else f"{roi:.3f}"
+        print(f"{row['name']:10s} {row['auc'] or 0:7.4f} {row['logloss'] or 0:8.4f} "
+              f"{row['top1'] or 0:7.4f} {row['top3'] or 0:7.4f} {sr:>7s} {n:>6d}")
+
+    roivals = [r["roi"] for r in rows]
+    print(f"\n=== どの指標が単勝ROIと連動するか（Spearman順位相関, min_er>={args.min_er}）===")
+    for metric in ("auc", "logloss", "top1", "top3"):
+        rho = _spearman([r[metric] for r in rows], roivals)
+        note = ("(logloss は低いほど良い＝負相関なら連動)" if metric == "logloss" else "")
+        print(f"  {metric:8s} vs ROI : rho={'--' if rho is None else f'{rho:+.3f}'}  {note}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     _load_env()
     parser = argparse.ArgumentParser(
@@ -452,6 +514,21 @@ def main(argv: list[str] | None = None) -> int:
     p_pc.add_argument("--to", dest="d_to", required=True, help="test 終了 YYYYMMDD")
     p_pc.add_argument("--no-progress", action="store_true")
     p_pc.set_defaults(func=_cmd_pair_correct)
+
+    p_mr = sub.add_parser("metric-roi",
+                          help="複数winモデルの test指標 vs 単勝ROI を測り、どの指標がROIと連動するか相関")
+    p_mr.add_argument("--win-models", required=True, help="winモデル(.joblib)のカンマ区切りリスト")
+    p_mr.add_argument("--place-model", required=True, help="固定の複勝モデル(単勝ROIには無関係だが必須)")
+    p_mr.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
+    p_mr.add_argument("--samples", type=int, default=2000,
+                      help="単勝は p_win 直使用でMC非依存＝小さくて良い(既定2000で高速)")
+    p_mr.add_argument("--from", dest="d_from", required=True, help="test 開始 YYYYMMDD")
+    p_mr.add_argument("--to", dest="d_to", required=True, help="test 終了 YYYYMMDD")
+    p_mr.add_argument("--min-er", type=float, default=1.1, help="単勝選別のEV下限(既定1.1)")
+    p_mr.add_argument("--min-prob", type=float, default=0.0)
+    p_mr.add_argument("--max-odds", type=float, default=None, help="単勝オッズ上限(既定50)")
+    p_mr.add_argument("--no-progress", action="store_true")
+    p_mr.set_defaults(func=_cmd_metric_roi)
 
     args = parser.parse_args(argv)
     return args.func(args)
