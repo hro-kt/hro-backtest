@@ -215,12 +215,81 @@ def run_backtest(
 # --------------------------------------------------------------------------- #
 # 閾値スイープ: 全候補を1パスで評価＆突合 → グリッドはメモリ集計（フラット100円ベット）
 # --------------------------------------------------------------------------- #
+def _eval_one_race(
+    race, db, conn_odds, conn_hr, win_b, place_b, permissive, sim, kelly,
+    want_st: bool, source: str, prob_calibrators: dict | None,
+) -> list[tuple]:
+    """1レースの候補評価＋nl_hr突合。候補タプルのリストを返す（並列/逐次で共用）。"""
+    rows = build_race_features(db, *race)
+    if not rows:
+        return []
+    race_id = "".join(race)
+    ab = race_abilities_from_dict(score_abilities(rows, win_b, place_b, race_id))
+    odds_lookup = load_odds_lookup(conn_odds, race, source=source, want_sanrentan=want_st)
+    segmap: dict = {}
+    for r in rows:
+        try:
+            u = int(r.get("umaban"))
+        except (TypeError, ValueError):
+            continue
+        runs = r.get("h_n_2y")
+        lay = r.get("days_since_prev")
+        segmap[u] = (int(runs) if runs is not None else 0,
+                     int(lay) if lay is not None else 9999)
+    res = decide_race(ab, odds_lookup, permissive,
+                      sim_config=sim, kelly_config=kelly, simultaneous=False,
+                      prob_calibrators=prob_calibrators)
+    out: list[tuple] = []
+    if res.candidates:
+        idx, settled_races = build_payout_index(load_payout_rows(conn_hr, {race_id}))
+        for c in res.candidates:
+            s = settle_result(
+                ExecutionResult(race_id=c.race_id, selection_id=c.selection_id,
+                                bet_type=c.bet_type, amount=100, odds=c.odds,
+                                mode="dry_run", status=STATUS_DRY_RUN, message="sweep"),
+                idx, settled_races,
+            )
+            segs = [segmap.get(int(x)) for x in c.selection_id.split("-")
+                    if x.strip().isdigit()]
+            if segs and all(g is not None for g in segs):
+                seg_runs = min(g[0] for g in segs)
+                seg_layoff = max(g[1] for g in segs)
+            else:
+                seg_runs, seg_layoff = None, None
+            out.append((c.bet_type, c.expected_return, c.probability,
+                        c.odds, s.settled, s.hit, s.payout, seg_runs, seg_layoff))
+    return out
+
+
+# --- 並列ワーカー（プロセス毎に独自DB接続＋モデルを1回だけ用意） ---
+_W: dict = {}
+
+
+def _init_worker(win_path, place_path, source, want_st, prob_calibrators,
+                 permissive, sim, kelly) -> None:
+    import os
+    import psycopg
+    os.environ.setdefault("OMP_NUM_THREADS", "1")  # プロセス並列でのスレッド過剰を防ぐ
+    _W["win_b"], _W["place_b"] = load_models(win_path, place_path)
+    _W["db"] = FeatureDB(load_features_config())
+    _W["conn_odds"] = opt_connect()
+    _W["conn_hr"] = psycopg.connect(PostgresConfig.from_env().conninfo)
+    _W.update(permissive=permissive, sim=sim, kelly=kelly,
+              want_st=want_st, source=source, prob_calibrators=prob_calibrators)
+
+
+def _worker_eval(race) -> list[tuple]:
+    return _eval_one_race(race, _W["db"], _W["conn_odds"], _W["conn_hr"],
+                          _W["win_b"], _W["place_b"], _W["permissive"], _W["sim"],
+                          _W["kelly"], _W["want_st"], _W["source"], _W["prob_calibrators"])
+
+
 def collect_settled_candidates(
     d_from: str, d_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None,
     limit: int | None = None, show_progress: bool = True,
     bet_types: tuple[str, ...] | None = None, prob_calibrators: dict | None = None,
-    max_odds: float | None = None,
+    max_odds: float | None = None, workers: int = 1,
 ) -> list[tuple]:
     """全レースの「フィルタ前の全候補」を評価し、nl_hr で突合した結果を返す。
 
@@ -246,79 +315,65 @@ def collect_settled_candidates(
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
     kelly = KellyConfig()
 
-    # nl_hr は tuple-row で読む別接続を保持し、1レースぶんを即突合（走行中ROIを表示）
-    import psycopg
-    db = FeatureDB(load_features_config())
-    conn_odds = opt_connect()
-    conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
     out: list[tuple] = []   # (bet_type, er, prob, odds, settled, hit, payout_per_100)
     run = [0, 0, 0.0, 0, 0]  # staked, payout, Σpred, Σhit, n_settled（走行中ROI＋較正比）
+    done = [0]
+
+    def _absorb(cands: list[tuple]) -> None:
+        out.extend(cands)
+        for (_bt, _e, p, _o, st, hit, pay, _r, _l) in cands:
+            if st:
+                run[0] += 100
+                run[1] += pay
+                run[2] += p
+                run[3] += 1 if hit else 0
+                run[4] += 1
+
+    def _tick() -> None:
+        done[0] += 1
+        if bar is not None:
+            bar.update(1)
+            roi = (run[1] / run[0]) if run[0] else None
+            cal = (run[3] / run[2]) if run[2] else None
+            bar.set_postfix(cands=len(out),
+                            ROI=("--" if roi is None else f"{roi:.3f}"),
+                            cal=("--" if cal is None else f"{cal:.2f}"))
+        elif show_progress and (done[0] % 100 == 0 or done[0] == len(races)):
+            roi = (run[1] / run[0]) if run[0] else float("nan")
+            print(f"  ... {done[0]}/{len(races)} races cands={len(out)} "
+                  f"ROI(all)={roi:.3f}", file=sys.stderr)
+
+    db = FeatureDB(load_features_config())
     races = list_races(db, d_from, d_to, limit=limit)
     bar = _progress_bar(len(races), show_progress)
     try:
-        for i, race in enumerate(races, 1):
-            rows = build_race_features(db, *race)
-            if rows:
-                race_id = "".join(race)
-                ab = race_abilities_from_dict(score_abilities(rows, win_b, place_b, race_id))
-                odds_lookup = load_odds_lookup(conn_odds, race, source=source,
-                                               want_sanrentan=want_st)
-                # セグメント属性（馬のキャリア本数=h_n_2y, 休養=days_since_prev）を馬番で引く
-                segmap: dict = {}
-                for r in rows:
-                    try:
-                        u = int(r.get("umaban"))
-                    except (TypeError, ValueError):
-                        continue
-                    runs = r.get("h_n_2y")
-                    lay = r.get("days_since_prev")
-                    segmap[u] = (int(runs) if runs is not None else 0,
-                                 int(lay) if lay is not None else 9999)
-                res = decide_race(ab, odds_lookup, permissive,
-                                  sim_config=sim, kelly_config=kelly, simultaneous=False,
-                                  prob_calibrators=prob_calibrators)
-                if res.candidates:
-                    idx, settled_races = build_payout_index(load_payout_rows(conn_hr, {race_id}))
-                    for c in res.candidates:
-                        s = settle_result(
-                            ExecutionResult(race_id=c.race_id, selection_id=c.selection_id,
-                                            bet_type=c.bet_type, amount=100, odds=c.odds,
-                                            mode="dry_run", status=STATUS_DRY_RUN, message="sweep"),
-                            idx, settled_races,
-                        )
-                        # 馬券の脚(複勝=1頭/ワイド2/三連複3)で、最少キャリア・最長休養を代表値に
-                        segs = [segmap.get(int(x)) for x in c.selection_id.split("-")
-                                if x.strip().isdigit()]
-                        if segs and all(g is not None for g in segs):
-                            seg_runs = min(g[0] for g in segs)
-                            seg_layoff = max(g[1] for g in segs)
-                        else:
-                            seg_runs, seg_layoff = None, None
-                        out.append((c.bet_type, c.expected_return, c.probability,
-                                    c.odds, s.settled, s.hit, s.payout, seg_runs, seg_layoff))
-                        if s.settled:
-                            run[0] += 100
-                            run[1] += s.payout
-                            run[2] += c.probability
-                            run[3] += 1 if s.hit else 0
-                            run[4] += 1
-            if bar is not None:
-                bar.update(1)
-                roi = (run[1] / run[0]) if run[0] else None
-                cal = (run[3] / run[2]) if run[2] else None
-                bar.set_postfix(cands=len(out),
-                                ROI=("--" if roi is None else f"{roi:.3f}"),
-                                cal=("--" if cal is None else f"{cal:.2f}"))
-            elif show_progress and (i % 100 == 0 or i == len(races)):
-                roi = (run[1] / run[0]) if run[0] else float("nan")
-                cal = (run[3] / run[2]) if run[2] else float("nan")
-                print(f"  ... {i}/{len(races)} races cands={len(out)} "
-                      f"ROI(all)={roi:.3f} cal(actual/pred)={cal:.2f}", file=sys.stderr)
+        if workers and workers > 1:
+            # spawn: 親のDB接続を子に継承させない（fork+psycopg のソケット共有事故を回避）。
+            # 各ワーカーは _init_worker で自前のDB接続＋モデルを1回だけ用意する。
+            from multiprocessing import get_context
+            ctx = get_context("spawn")
+            initargs = (win_path, place_path, source, want_st, prob_calibrators,
+                        permissive, sim, kelly)
+            with ctx.Pool(workers, initializer=_init_worker, initargs=initargs) as pool:
+                for cands in pool.imap_unordered(_worker_eval, races, chunksize=4):
+                    _absorb(cands)
+                    _tick()
+        else:
+            import psycopg
+            conn_odds = opt_connect()
+            conn_hr = psycopg.connect(PostgresConfig.from_env().conninfo)
+            try:
+                for race in races:
+                    _absorb(_eval_one_race(race, db, conn_odds, conn_hr, win_b, place_b,
+                                           permissive, sim, kelly, want_st, source,
+                                           prob_calibrators))
+                    _tick()
+            finally:
+                conn_hr.close()
+                conn_odds.close()
     finally:
         if bar is not None:
             bar.close()
-        conn_hr.close()
-        conn_odds.close()
         db.close()
     return out
 

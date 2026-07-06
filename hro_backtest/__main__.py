@@ -181,7 +181,7 @@ def _cmd_sweep(args) -> int:
             args.d_from, args.d_to, args.win_model, args.place_model,
             source=args.source, samples=args.samples, limit=args.limit,
             show_progress=not args.no_progress, bet_types=bet_types, prob_calibrators=calib,
-            max_odds=args.max_odds,
+            max_odds=args.max_odds, workers=args.workers,
         )
         if args.save_candidates:
             _write_candidates(args.save_candidates, settled)
@@ -457,6 +457,8 @@ def main(argv: list[str] | None = None) -> int:
     p_sw.add_argument("--min-layoff", type=int, default=None,
                       help="セグメント: 最長休養日数がこれ以上のみ。休み明け検証用(新馬=9999)")
     p_sw.add_argument("--no-progress", action="store_true")
+    p_sw.add_argument("--workers", type=int, default=1,
+                      help="collect のレース並列数(既定1=逐次)。三連複など重い時にコア数-2程度を推奨")
     p_sw.add_argument("--out", type=Path, default=None, help="全グリッドを CSV 出力")
     p_sw.add_argument("--save-candidates", default=None,
                       help="collect 結果(候補)を CSV 保存。後で --load-candidates で即再スライス")
