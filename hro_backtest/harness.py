@@ -257,7 +257,8 @@ def _eval_one_race(
             else:
                 seg_runs, seg_layoff = None, None
             out.append((c.bet_type, c.expected_return, c.probability,
-                        c.odds, s.settled, s.hit, s.payout, seg_runs, seg_layoff))
+                        c.odds, s.settled, s.hit, s.payout, seg_runs, seg_layoff,
+                        race_id))
     return out
 
 
@@ -321,7 +322,7 @@ def collect_settled_candidates(
 
     def _absorb(cands: list[tuple]) -> None:
         out.extend(cands)
-        for (_bt, _e, p, _o, st, hit, pay, _r, _l) in cands:
+        for (_bt, _e, p, _o, st, hit, pay, _r, _l, *_) in cands:
             if st:
                 run[0] += 100
                 run[1] += pay
@@ -378,6 +379,46 @@ def collect_settled_candidates(
     return out
 
 
+def points_roi(
+    settled: list[tuple], bet_type: str, min_er: float, min_prob: float,
+    k_list: list[int],
+) -> dict[int, tuple[int, float | None, float | None, int]]:
+    """買い目の点数最適化: レース毎に (er,prob) で絞った候補を er 降順で上位K点だけ買う。
+
+    K=0 は無制限(=全通り, 現行 sweep と同じ)。返り: {K: (n_bets, roi, hit_rate, n_races)}。
+    候補タプルの race_id は末尾([9])。settled のみ集計(フラット100円)。
+    """
+    byrace: dict[str, list[tuple]] = {}
+    for t in settled:
+        bt, er, prob = t[0], t[1], t[2]
+        if bt != bet_type or er < min_er or prob < min_prob:
+            continue
+        rid = t[9] if len(t) > 9 else ""
+        byrace.setdefault(rid, []).append((er, t[4], t[5], t[6]))  # er, settled, hit, payout
+    out: dict[int, tuple] = {}
+    for k in k_list:
+        n = stake = payout = hits = races = 0
+        for rid, cands in byrace.items():
+            cs = sorted(cands, key=lambda x: -x[0])
+            if k > 0:
+                cs = cs[:k]
+            race_used = False
+            for _er, st, hit, pay in cs:
+                if not st:
+                    continue
+                n += 1
+                stake += 100
+                payout += pay
+                hits += 1 if hit else 0
+                race_used = True
+            if race_used:
+                races += 1
+        roi = (payout / stake) if stake else None
+        hr = (hits / n) if n else None
+        out[k] = (n, roi, hr, races)
+    return out
+
+
 def sweep_roi(
     settled: list[tuple], er_grid: list[float], prob_grid: list[float],
 ) -> dict[str, dict[tuple[float, float], tuple[int, float | None, float | None]]]:
@@ -391,7 +432,7 @@ def sweep_roi(
     for er in er_grid:
         for pr in prob_grid:
             acc = {t: [0, 0, 0, 0] for t in types}  # n, stake, payout, hits
-            for bt, e, p, odds, st, hit, pay, _r, _l in settled:
+            for bt, e, p, odds, st, hit, pay, _r, _l, *_ in settled:
                 if not st or e < er or p < pr:
                     continue
                 for key in ("ALL", bt):
@@ -422,7 +463,7 @@ def calibration_table(
     from collections import defaultdict
 
     by: dict[str, list] = defaultdict(list)
-    for bt, _er, prob, _odds, st, hit, pay, _r, _l in settled:
+    for bt, _er, prob, _odds, st, hit, pay, _r, _l, *_ in settled:
         if st:
             by[bt].append((prob, 1 if hit else 0, pay))
 
@@ -521,7 +562,7 @@ def odds_band_roi(
     types = ["ALL", "win", "place", "wide", "trio", "sanrentan"]
     acc = {t: {b: [0, 0, 0, 0] for b in bands} for t in types}
     last_hi = bands[-1][1] if bands else None
-    for bt, e, p, odds, st, hit, pay, _r, _l in settled:
+    for bt, e, p, odds, st, hit, pay, _r, _l, *_ in settled:
         if not st or e < ref_er or p < ref_prob:
             continue
         band = None

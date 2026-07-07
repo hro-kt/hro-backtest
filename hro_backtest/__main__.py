@@ -141,7 +141,7 @@ def _write_candidates(path: str, settled: list) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["bet_type", "er", "prob", "odds", "settled", "hit", "payout",
-                    "seg_runs", "seg_layoff"])
+                    "seg_runs", "seg_layoff", "race_id"])
         for t in settled:
             w.writerow(t)
 
@@ -152,11 +152,12 @@ def _read_candidates(path: str) -> list[tuple]:
         r = csv.reader(f)
         next(r, None)
         for row in r:
-            bt, er, prob, odds, st, hit, pay, sr, sl = row
+            bt, er, prob, odds, st, hit, pay, sr, sl = row[:9]
+            rid = row[9] if len(row) > 9 else ""   # 旧形式(race_id無)も読める
             out.append((bt, float(er), float(prob), float(odds),
                         st == "True", hit == "True", int(pay),
                         (int(sr) if sr not in ("", "None") else None),
-                        (int(sl) if sl not in ("", "None") else None)))
+                        (int(sl) if sl not in ("", "None") else None), rid))
     return out
 
 
@@ -230,6 +231,44 @@ def _cmd_sweep(args) -> int:
                     w.writerow([t, er, p, n, "" if roi is None else f"{roi:.4f}",
                                 "" if hr is None else f"{hr:.4f}"])
         print(f"\n-> wrote full sweep grid to {args.out}")
+    return 0
+
+
+def _cmd_points(args) -> int:
+    from . import harness
+
+    calib = None
+    if args.trio_calib:
+        from hro_optimizer.calibration import load_calibrators
+        calib = load_calibrators(args.trio_calib)
+    if args.load_candidates:
+        settled = _read_candidates(args.load_candidates)
+        print(f"loaded {len(settled)} candidates from {args.load_candidates}")
+        if settled and not settled[0][9]:
+            raise SystemExit("この候補CSVは race_id 無し(旧形式)。--save-candidates で取り直してください")
+    else:
+        if not (args.win_model and args.place_model and args.d_from and args.d_to):
+            raise SystemExit("collect には --win-model/--place-model/--from/--to が必須"
+                             "（再スライスのみなら --load-candidates）")
+        settled = harness.collect_settled_candidates(
+            args.d_from, args.d_to, args.win_model, args.place_model,
+            source=args.source, samples=args.samples, limit=args.limit,
+            show_progress=not args.no_progress, bet_types=(args.bet_type,),
+            prob_calibrators=calib, max_odds=args.max_odds, workers=args.workers,
+        )
+        if args.save_candidates:
+            _write_candidates(args.save_candidates, settled)
+            print(f"saved {len(settled)} candidates to {args.save_candidates}")
+    k_list = [int(x) for x in args.k.split(",") if x.strip() != ""]
+    res = harness.points_roi(settled, args.bet_type, args.min_er, args.min_prob, k_list)
+    print(f"\n=== Points [{args.bet_type}] min_er>={args.min_er} min_prob>={args.min_prob} "
+          f"(flat ¥100, レース毎に EV 上位K点だけ購入) ===")
+    print(f"{'K/race':>8} | {'ROI':>7} | {'bets':>7} | {'races':>6} | {'hit%':>6}")
+    for k in k_list:
+        n, roi, hr, races = res[k]
+        klabel = "all" if k == 0 else str(k)
+        print(f"{klabel:>8} | {('--' if roi is None else f'{roi:.3f}'):>7} | {n:>7} | "
+              f"{races:>6} | {('--' if hr is None else f'{hr*100:.1f}'):>6}")
     return 0
 
 
@@ -384,7 +423,7 @@ def _cmd_metric_roi(args) -> int:
             max_odds=args.max_odds, show_progress=not args.no_progress,
         )
         stake = payout = n = 0
-        for bt, er, prob, odds, st, hit, pay, _r, _l in settled:
+        for bt, er, prob, odds, st, hit, pay, _r, _l, *_ in settled:
             if not st or er < args.min_er or prob < args.min_prob:
                 continue
             n += 1
@@ -465,6 +504,30 @@ def main(argv: list[str] | None = None) -> int:
     p_sw.add_argument("--load-candidates", default=None,
                       help="保存済み候補 CSV から読む（collect を省略＝grid/ref/帯の再スライスが一瞬）")
     p_sw.set_defaults(func=_cmd_sweep)
+
+    p_pt = sub.add_parser("points",
+                          help="買い目の点数最適化: レース毎に EV 上位K点だけ買った時の ROI")
+    p_pt.add_argument("--win-model", default=None, help="--load-candidates 時は不要")
+    p_pt.add_argument("--place-model", default=None, help="--load-candidates 時は不要")
+    p_pt.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
+    p_pt.add_argument("--samples", type=int, default=None)
+    p_pt.add_argument("--from", dest="d_from", default=None, help="YYYYMMDD")
+    p_pt.add_argument("--to", dest="d_to", default=None, help="YYYYMMDD")
+    p_pt.add_argument("--limit", type=int, default=None)
+    p_pt.add_argument("--bet-type", default="trio", help="対象券種(既定 trio)")
+    p_pt.add_argument("--min-er", type=float, default=1.2, help="EV下限(既定1.2)")
+    p_pt.add_argument("--min-prob", type=float, default=0.10, help="確率下限(既定0.10)")
+    p_pt.add_argument("--k", default="1,2,3,5,10,0",
+                      help="レース毎に買う上位K点(カンマ区切り, 0=全通り=現行sweep相当)")
+    p_pt.add_argument("--max-odds", type=float, default=2000.0)
+    p_pt.add_argument("--workers", type=int, default=1)
+    p_pt.add_argument("--trio-calib", default=None,
+                      help="券種別確率較正の JSON パス(EV前に適用)")
+    p_pt.add_argument("--save-candidates", default=None)
+    p_pt.add_argument("--load-candidates", default=None,
+                      help="race_id 入り候補CSV（新形式）から即再スライス")
+    p_pt.add_argument("--no-progress", action="store_true")
+    p_pt.set_defaults(func=_cmd_points)
 
     p_cal = sub.add_parser("calib", help="較正診断: モデル確率 vs 実的中率(デシル別)")
     p_cal.add_argument("--win-model", required=True)
