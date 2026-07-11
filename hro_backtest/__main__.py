@@ -332,6 +332,7 @@ def _cmd_fit_trio_calib(args) -> int:
     fit = harness.fit_trio_calibrator(
         args.cal_from, args.cal_to, args.win_model, args.place_model,
         source=args.source, samples=args.samples, show_progress=not args.no_progress,
+        workers=args.workers,
     )
     out = {"trio": fit}
     with open(args.out, "w", encoding="utf-8") as f:
@@ -564,6 +565,8 @@ def main(argv: list[str] | None = None) -> int:
     p_ft.add_argument("--cal-from", required=True, help="較正期間 開始 YYYYMMDD")
     p_ft.add_argument("--cal-to", required=True, help="較正期間 終了 YYYYMMDD")
     p_ft.add_argument("--out", required=True, help="出力 JSON パス")
+    p_ft.add_argument("--workers", type=int, default=1,
+                      help="較正候補collectのレース並列数(コア数-2程度を推奨)")
     p_ft.add_argument("--no-progress", action="store_true")
     p_ft.set_defaults(func=_cmd_fit_trio_calib)
 

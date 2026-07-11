@@ -76,6 +76,7 @@ def list_races(db: FeatureDB, d_from: str, d_to: str, limit: int | None = None) 
     rows = db.query(
         "SELECT DISTINCT year, month_day, jyo_cd, kaiji, nichiji, race_num "
         "FROM feat_labels WHERE (year || month_day) BETWEEN %(a)s AND %(b)s "
+        "  AND jyo_cd IN ('01','02','03','04','05','06','07','08','09','10') "  # JRA(中央)のみ。地方/海外は三連複オッズ/払戻が無く賭けられない
         "ORDER BY year, month_day, jyo_cd, race_num",
         {"a": d_from, "b": d_to},
     )
@@ -490,11 +491,12 @@ def calibration_table(
 def fit_trio_calibrator(
     cal_from: str, cal_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None, show_progress: bool = True,
+    workers: int = 1,
 ) -> dict:
     """較正期間の trio 候補から isotonic 較正器 {"xs","ys"} を学習して返す（保存用）。"""
     cal_settled = collect_settled_candidates(
         cal_from, cal_to, win_path, place_path, source=source, samples=samples,
-        show_progress=show_progress, bet_types=("trio",))
+        show_progress=show_progress, bet_types=("trio",), workers=workers)
     probs = [t[2] for t in cal_settled if t[4]]
     hits = [1 if t[5] else 0 for t in cal_settled if t[4]]
     if len(probs) < 50:
