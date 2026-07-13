@@ -259,7 +259,7 @@ def _eval_one_race(
                 seg_runs, seg_layoff = None, None
             out.append((c.bet_type, c.expected_return, c.probability,
                         c.odds, s.settled, s.hit, s.payout, seg_runs, seg_layoff,
-                        race_id))
+                        race_id, c.selection_id))
     return out
 
 

@@ -141,7 +141,7 @@ def _write_candidates(path: str, settled: list) -> None:
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(["bet_type", "er", "prob", "odds", "settled", "hit", "payout",
-                    "seg_runs", "seg_layoff", "race_id"])
+                    "seg_runs", "seg_layoff", "race_id", "selection_id"])
         for t in settled:
             w.writerow(t)
 
@@ -154,10 +154,11 @@ def _read_candidates(path: str) -> list[tuple]:
         for row in r:
             bt, er, prob, odds, st, hit, pay, sr, sl = row[:9]
             rid = row[9] if len(row) > 9 else ""   # 旧形式(race_id無)も読める
+            sel = row[10] if len(row) > 10 else ""  # 馬番(selection_id)。旧形式は空
             out.append((bt, float(er), float(prob), float(odds),
                         st == "True", hit == "True", int(pay),
                         (int(sr) if sr not in ("", "None") else None),
-                        (int(sl) if sl not in ("", "None") else None), rid))
+                        (int(sl) if sl not in ("", "None") else None), rid, sel))
     return out
 
 
