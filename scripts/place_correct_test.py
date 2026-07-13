@@ -42,6 +42,8 @@ def _f(v):
 
 
 def main():
+    import warnings
+    warnings.filterwarnings("ignore")
     import numpy as np
     import lightgbm as lgb
 
@@ -115,7 +117,7 @@ def main():
 
     # 3) walk-forward: block i を それ以前で学習した補正で OOS 選別
     print(f"{'block':8} {'baseline ROI(n)':>20} {'corrected ROI(n)':>22} {'hit%':>7}")
-    pooled_base, pooled_corr = [], []
+    pooled_base, pooled_corr, pooled_flo, pooled_fhi = [], [], [], []
     for i in range(1, len(ORDER)):
         te = ORDER[i]
         if te not in per_year:
@@ -132,6 +134,7 @@ def main():
         Xte, _ = build(te_rows)
         calp = clf.predict_proba(Xte)[:, 1]
         for r, p in zip(te_rows, calp):
+            r["cal_p"] = p
             r["cal_er"] = p * r["odds"]
         base_sel = [r for r in te_rows if r["base"]]
         k = len(base_sel)
@@ -140,12 +143,21 @@ def main():
         nc, rc, hc = roi(corr_sel)
         print(f"{te:8} {f'{rb:.3f}({nb})':>20} {f'{rc:.3f}({nc})':>22} {hc:>6.1f}%")
         pooled_base += base_sel; pooled_corr += corr_sel
+        # 変種: baseline内を cal_p 中央値で二分(補正=フィルタ)。上位半分が良ければ低cal_pを落とせる。
+        bs = sorted(base_sel, key=lambda r: r["cal_p"])
+        h = len(bs) // 2
+        pooled_flo += bs[:h]; pooled_fhi += bs[h:]
 
     nb, rb, _ = roi(pooled_base)
     nc, rc, hc = roi(pooled_corr)
     print("-" * 60)
-    print(f"POOLED baseline: ROI={rb:.4f} n={nb}")
-    print(f"POOLED corrected: ROI={rc:.4f} n={nc} hit={hc:.1f}%  (volume-matched)")
+    print(f"POOLED baseline:  ROI={rb:.4f} n={nb}")
+    print(f"POOLED corrected(再選別): ROI={rc:.4f} n={nc} hit={hc:.1f}%")
+    nlo, rlo, _ = roi(pooled_flo)
+    nhi, rhi, _ = roi(pooled_fhi)
+    print(f"[フィルタ変種] baseline内 cal_p 下位半分: ROI={rlo:.4f} n={nlo}")
+    print(f"[フィルタ変種] baseline内 cal_p 上位半分: ROI={rhi:.4f} n={nhi}")
+    print("  → 上位>>下位 なら『低cal_pのbaseline betを落とす』が有効(補正=フィルタ)")
 
 
 if __name__ == "__main__":
