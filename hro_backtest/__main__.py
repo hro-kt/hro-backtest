@@ -132,6 +132,19 @@ def _cmd_backtest(args) -> int:
     return 0
 
 
+def _cmd_backfill_predictions(args) -> int:
+    from . import predlog
+
+    res = predlog.backfill_predictions(
+        args.d_from, args.d_to, args.win_model, args.place_model,
+        source=args.source, limit=args.limit, show_progress=not args.no_progress,
+    )
+    print(f"\n=== backfill-predictions [{res['window']}] ===")
+    print(f"model_version={res['model_version']} source={res['source']}")
+    print(f"races={res['races']} rows(=馬×レース)={res['rows']} -> prediction_log にUPSERT")
+    return 0
+
+
 def _floats(s: str) -> list[float]:
     return [float(x) for x in s.split(",") if x.strip() != ""]
 
@@ -598,6 +611,18 @@ def main(argv: list[str] | None = None) -> int:
     p_mr.add_argument("--max-odds", type=float, default=None, help="単勝オッズ上限(既定50)")
     p_mr.add_argument("--no-progress", action="store_true")
     p_mr.set_defaults(func=_cmd_metric_roi)
+
+    p_bf = sub.add_parser("backfill-predictions",
+                          help="過去JRAをモデル採点し prediction_log へ保存(MLOps監視の土台)")
+    p_bf.add_argument("--win-model", required=True, help="単勝モデル(target=y_win)")
+    p_bf.add_argument("--place-model", required=True, help="複勝モデル(target=y_fukusyo)")
+    p_bf.add_argument("--from", dest="d_from", required=True, help="YYYYMMDD")
+    p_bf.add_argument("--to", dest="d_to", required=True, help="YYYYMMDD")
+    p_bf.add_argument("--source", default="backfill",
+                      help="prediction_log.source(既定 backfill)")
+    p_bf.add_argument("--limit", type=int, default=None, help="先頭 N レースだけ(動作確認用)")
+    p_bf.add_argument("--no-progress", action="store_true")
+    p_bf.set_defaults(func=_cmd_backfill_predictions)
 
     args = parser.parse_args(argv)
     return args.func(args)
