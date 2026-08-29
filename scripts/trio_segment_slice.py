@@ -61,6 +61,8 @@ def _odds_band(o):
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("csv", help="sweep --save-candidates の CSV")
+    ap.add_argument("--bet-type", default="trio", choices=("trio", "wide", "place"),
+                    help="スライスする券種(既定 trio)")
     ap.add_argument("--er", type=float, default=1.7, help="min_er")
     ap.add_argument("--prob", type=float, default=0.0, help="min_prob")
     ap.add_argument("--min-n", type=int, default=300, help="着目する最小n")
@@ -76,7 +78,7 @@ def main() -> int:
             bt, er, prob, odds = row[0], float(row[1]), float(row[2]), float(row[3])
             settled, hit, payout = row[4] == "True", row[5] == "True", int(row[6])
             rid, sel = (row[9] if len(row) > 9 else ""), (row[10] if len(row) > 10 else "")
-            if bt != "trio" or not settled:
+            if bt != args.bet_type or not settled:
                 continue
             if er < args.er or prob < args.prob:
                 continue
@@ -126,7 +128,7 @@ def main() -> int:
             s[0] += 1; s[1] += 100; s[2] += payout
 
     n, stake, pay = overall
-    print(f"\n== 全体 == n={n:,} ROI={pay/stake:.3f} hitはpayout>0で近似")
+    print(f"\n== 全体 [{args.bet_type}] == n={n:,} ROI={pay/stake:.3f} hitはpayout>0で近似")
     print(f"  (閾値 er>={args.er} prob>={args.prob}, min-n={args.min_n})")
     for d in dims:
         print(f"\n== {d} 別 ==")
