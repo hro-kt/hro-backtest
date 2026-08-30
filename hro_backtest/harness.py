@@ -106,6 +106,35 @@ def orders_for_race(
     return abilities_dict, result.orders
 
 
+def orders_for_race_multi(
+    db: FeatureDB, conn_odds, win_b: ModelBundle, place_b: ModelBundle, race: RaceKey, *,
+    bettings: list, money: MoneyManagerConfig, sim: SimConfig, kelly: KellyConfig,
+    source: str, simultaneous: bool, prob_calibrators: dict | None = None,
+) -> tuple[dict | None, list]:
+    """1レースを **複数の betting プラン**で判断し、全プランの BetOrder を結合して返す。
+
+    能力値(2モデル推論)とオッズ取得は1回だけ行い、プランごとに run_decide_pipeline を回す
+    (券種別に別閾値=例 trio帯[1.7,2.0] と wide er>=1.7&prob>=0.10 を同時運用するため)。
+    戻り (abilities_dict|None, 結合済み BetOrder list)。
+    """
+    rows = build_race_features(db, *race)
+    if not rows:
+        return None, []
+    race_id = "".join(race)
+    abilities_dict = score_abilities(rows, win_b, place_b, race_id)
+    abilities = race_abilities_from_dict(abilities_dict)
+    odds_lookup = load_odds_lookup(conn_odds, race, source=source)
+    orders = []
+    for betting in bettings:
+        result = run_decide_pipeline(
+            abilities, odds_lookup, betting, money,
+            sim_config=sim, kelly_config=kelly, simultaneous=simultaneous,
+            prob_calibrators=prob_calibrators,
+        )
+        orders.extend(result.orders)
+    return abilities_dict, orders
+
+
 def _to_exec(order) -> ExecutionResult:
     """BetOrder → settlement が突合できる ExecutionResult(dry_run 記録扱い)。"""
     return ExecutionResult(
