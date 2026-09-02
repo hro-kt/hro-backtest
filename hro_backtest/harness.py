@@ -40,7 +40,7 @@ RaceKey = tuple[str, str, str, str, str, str]
 
 
 def betting_config(source: str, *, min_er=None, min_prob=None, max_odds_age=None,
-                   max_odds=None) -> BettingConfig:
+                   max_odds=None, ev_lcb_z=None) -> BettingConfig:
     """confirmed は鮮度ガード無制限を既定に（確定オッズは鮮度概念なし）。閾値は任意で上書き。
 
     max_odds: オッズ上限（既定 50）。三連単/高配当ゾーンを狙うときに引き上げる。
@@ -54,6 +54,7 @@ def betting_config(source: str, *, min_er=None, min_prob=None, max_odds_age=None
         min_probability=(min_prob if min_prob is not None else d.min_probability),
         max_odds_age_seconds=age,
         max_odds=(max_odds if max_odds is not None else d.max_odds),
+        ev_lcb_z=(ev_lcb_z if ev_lcb_z is not None else d.ev_lcb_z),
     )
 
 
@@ -168,7 +169,7 @@ def run_backtest(
     d_from: str, d_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None, max_total: float | None = None,
     independent_kelly: bool = False, min_er=None, min_prob=None, max_odds_age=None,
-    max_odds=None,
+    max_odds=None, ev_lcb_z=None,
     limit: int | None = None, show_progress: bool = True, prob_calibrators: dict | None = None,
 ) -> BacktestResult:
     """期間バックテスト: 各レースで bet を生成し、nl_hr 払戻と突合して ROI を出す。
@@ -178,7 +179,8 @@ def run_backtest(
     """
     win_b, place_b = load_models(win_path, place_path)
     betting = betting_config(source, min_er=min_er, min_prob=min_prob,
-                             max_odds_age=max_odds_age, max_odds=max_odds)
+                             max_odds_age=max_odds_age, max_odds=max_odds,
+                             ev_lcb_z=ev_lcb_z)
     money = MoneyManagerConfig()
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
     kelly = KellyConfig(max_total=max_total) if max_total else KellyConfig()
@@ -320,7 +322,7 @@ def collect_settled_candidates(
     source: str = "confirmed", samples: int | None = None,
     limit: int | None = None, show_progress: bool = True,
     bet_types: tuple[str, ...] | None = None, prob_calibrators: dict | None = None,
-    max_odds: float | None = None, workers: int = 1,
+    max_odds: float | None = None, workers: int = 1, ev_lcb_z=None,
 ) -> list[tuple]:
     """全レースの「フィルタ前の全候補」を評価し、nl_hr で突合した結果を返す。
 
@@ -341,6 +343,8 @@ def collect_settled_candidates(
     if max_odds is not None:
         bt_kw["max_odds"] = max_odds
     want_st = bool(bet_types) and "sanrentan" in bet_types  # 三連単オッズ(nl_o6)は要求時のみ読む
+    if ev_lcb_z is not None:
+        bt_kw["ev_lcb_z"] = ev_lcb_z   # ★LCBは確率自体を変えるので収集時に適用(zごとに再収集が必要)
     permissive = BettingConfig(min_expected_return=0.0, min_probability=0.0,
                                max_odds_age_seconds=age, **bt_kw)
     sim = SimConfig(n_samples=samples) if samples else SimConfig()
@@ -520,17 +524,104 @@ def calibration_table(
 def fit_trio_calibrator(
     cal_from: str, cal_to: str, win_path: str, place_path: str, *,
     source: str = "confirmed", samples: int | None = None, show_progress: bool = True,
-    workers: int = 1,
+    workers: int = 1, ev_lcb_z=None,
 ) -> dict:
-    """較正期間の trio 候補から isotonic 較正器 {"xs","ys"} を学習して返す（保存用）。"""
+    """較正期間の trio 候補から isotonic 較正器 {"xs","ys"} を学習して返す（保存用）。
+
+    ★ev_lcb_z は決定時と同じ値を渡すこと。較正器は「決定時に入力される確率」→実頻度の
+      写像なので、LCB を使う運用なら較正も LCB 後の確率で学習しないと整合しない。
+    """
     cal_settled = collect_settled_candidates(
         cal_from, cal_to, win_path, place_path, source=source, samples=samples,
-        show_progress=show_progress, bet_types=("trio",), workers=workers)
+        show_progress=show_progress, bet_types=("trio",), workers=workers,
+        ev_lcb_z=ev_lcb_z)
     probs = [t[2] for t in cal_settled if t[4]]
     hits = [1 if t[5] else 0 for t in cal_settled if t[4]]
     if len(probs) < 50:
         raise RuntimeError(f"較正用 trio サンプルが少なすぎます (n={len(probs)})")
     return fit_calibrator(probs, hits)
+
+
+def _field_sizes_for(race_ids) -> dict:
+    """race_id -> field_size を feat_matrix から引く(条件付き較正のバケット判定用)。"""
+    db = FeatureDB(load_features_config())
+    RID = "(year||month_day||jyo_cd||kaiji||nichiji||race_num)"
+    out: dict = {}
+    try:
+        ids = list({r for r in race_ids if r})
+        for i in range(0, len(ids), 5000):
+            rows = db.query(
+                f"SELECT {RID} rid, max(field_size) fs FROM feat_matrix "
+                f"WHERE {RID} = ANY(%(ids)s) GROUP BY 1", {"ids": ids[i:i + 5000]})
+            for r in rows:
+                out[r["rid"]] = r["fs"]
+    finally:
+        db.close()
+    return out
+
+
+def fit_calibrators(
+    cal_from: str, cal_to: str, win_path: str, place_path: str, *,
+    bet_types: tuple[str, ...] = ("trio", "wide"),
+    by_field: bool = True, min_bucket_n: int = 300,
+    source: str = "confirmed", samples: int | None = None, show_progress: bool = True,
+    workers: int = 1, ev_lcb_z=None, max_odds: float | None = None,
+) -> dict:
+    """券種ごとに isotonic 較正器を学習。任意で頭数バケット別(条件付き)も同梱する。
+
+    返り: {bet_type: {"xs","ys"[, "by_field": {bucket: {"xs","ys"}}]}}
+    - **wide も対象**(従来は trio のみ較正で wide は無較正＝PLバイアスが素通しだった)。
+    - by_field=True で頭数バケット別も学習。C(n,3) が頭数で急増する＝Harville の系統誤差が
+      頭数依存なので、全体1本より素性が合う。サンプルが min_bucket_n 未満のバケットは
+      過適合を避けて出力しない(適用側は全体較正にフォールバック)。
+    - ev_lcb_z は決定時と同じ値を渡す(較正は「決定時に入る確率」→実頻度の写像)。
+    """
+    from hro_optimizer.calibration import field_bucket
+
+    settled = collect_settled_candidates(
+        cal_from, cal_to, win_path, place_path, source=source, samples=samples,
+        show_progress=show_progress, bet_types=tuple(bet_types), workers=workers,
+        ev_lcb_z=ev_lcb_z, max_odds=max_odds)
+    rows = [t for t in settled if t[4]]           # settled(=払戻データあり)のみ
+    if not rows:
+        raise RuntimeError("較正用の確定済み候補が0件です(期間/データを確認)")
+
+    fs_map = _field_sizes_for([t[9] for t in rows]) if by_field else {}
+    out: dict = {}
+    for bt in bet_types:
+        sub = [t for t in rows if t[0] == bt]
+        probs = [t[2] for t in sub]
+        hits = [1 if t[5] else 0 for t in sub]
+        if len(probs) < 50:
+            print(f"  [{bt}] サンプル不足 n={len(probs)} -> スキップ")
+            continue
+        entry = dict(fit_calibrator(probs, hits))
+        entry["n"] = len(probs)
+        if by_field:
+            buckets: dict = {}
+            for t in sub:
+                b = field_bucket(fs_map.get(t[9]))
+                if b == "unknown":
+                    continue
+                buckets.setdefault(b, ([], []))
+                buckets[b][0].append(t[2])
+                buckets[b][1].append(1 if t[5] else 0)
+            bf = {}
+            for b, (bp, bh) in sorted(buckets.items()):
+                if len(bp) < min_bucket_n or sum(bh) < 5:   # 過適合/退化を避ける
+                    print(f"  [{bt}] bucket {b}: n={len(bp)} hits={sum(bh)} -> 不採用")
+                    continue
+                bf[b] = dict(fit_calibrator(bp, bh))
+                bf[b]["n"] = len(bp)
+                print(f"  [{bt}] bucket {b}: n={len(bp)} hits={sum(bh)} -> 採用")
+            if bf:
+                entry["by_field"] = bf
+        out[bt] = entry
+        print(f"  [{bt}] 全体較正 n={len(probs)} hits={sum(hits)} "
+              f"by_field={list(entry.get('by_field', {}).keys())}")
+    if not out:
+        raise RuntimeError("どの券種も較正器を学習できませんでした")
+    return out
 
 
 def run_trio_calibration(

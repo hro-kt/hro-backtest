@@ -40,6 +40,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="オッズ鮮度上限(秒)。未指定: confirmed=無制限 / live=60s")
     p.add_argument("--trio-calib", default=None,
                    help="券種別確率較正の JSON パス（fit-trio-calib 出力。EV 前に適用）")
+    p.add_argument("--ev-lcb-z", type=float, default=None,
+                   help="EV下側信頼限界のz(既定0=従来)。walk-forwardで最適zを探る")
 
 
 def _cmd_run(args) -> int:
@@ -112,6 +114,7 @@ def _cmd_backtest(args) -> int:
         source=args.source, samples=args.samples, max_total=args.max_total,
         independent_kelly=args.independent_kelly, min_er=args.min_er,
         min_prob=args.min_prob, max_odds_age=args.max_odds_age, max_odds=args.max_odds,
+        ev_lcb_z=args.ev_lcb_z,
         limit=args.limit, show_progress=not args.no_progress, prob_calibrators=calib,
     )
     print(f"\n=== Backtest [{args.d_from}..{args.d_to}] source={args.source} ===")
@@ -196,7 +199,7 @@ def _cmd_sweep(args) -> int:
             args.d_from, args.d_to, args.win_model, args.place_model,
             source=args.source, samples=args.samples, limit=args.limit,
             show_progress=not args.no_progress, bet_types=bet_types, prob_calibrators=calib,
-            max_odds=args.max_odds, workers=args.workers,
+            max_odds=args.max_odds, workers=args.workers, ev_lcb_z=args.ev_lcb_z,
         )
         if args.save_candidates:
             _write_candidates(args.save_candidates, settled)
@@ -336,6 +339,28 @@ def _trio_grid(label, table, er_grid, prob_grid) -> None:
             n, roi, _ = table[(er, p)]
             cells.append(f"{('--' if roi is None else f'{roi:.3f}'):>6}({n:>4})" if n else f"{'--':>11}")
         print(f"  {er:>16.2f} | " + " | ".join(cells))
+
+
+def _cmd_fit_calib(args) -> int:
+    """券種別(trio/wide)＋頭数バケット別の較正器を学習して JSON 保存。"""
+    import json
+    from . import harness
+
+    bet_types = tuple(x.strip() for x in args.bet_types.split(",") if x.strip())
+    print(f"=== fit-calib [{args.cal_from}..{args.cal_to}] bet_types={bet_types} "
+          f"by_field={not args.no_by_field} ev_lcb_z={args.ev_lcb_z} ===")
+    calibs = harness.fit_calibrators(
+        args.cal_from, args.cal_to, args.win_model, args.place_model,
+        bet_types=bet_types, by_field=not args.no_by_field,
+        min_bucket_n=args.min_bucket_n, source=args.source, samples=args.samples,
+        show_progress=not args.no_progress, workers=args.workers,
+        ev_lcb_z=args.ev_lcb_z, max_odds=args.max_odds,
+    )
+    with open(args.out, "w", encoding="utf-8") as f:
+        json.dump(calibs, f, ensure_ascii=False)
+    print(f"\n-> wrote {args.out}")
+    print("  適用: run-day/backtest の --calib / --trio-calib にこのパスを渡す")
+    return 0
 
 
 def _cmd_fit_trio_calib(args) -> int:
@@ -583,6 +608,26 @@ def main(argv: list[str] | None = None) -> int:
                       help="較正候補collectのレース並列数(コア数-2程度を推奨)")
     p_ft.add_argument("--no-progress", action="store_true")
     p_ft.set_defaults(func=_cmd_fit_trio_calib)
+
+    p_fc = sub.add_parser("fit-calib",
+                          help="券種別(trio/wide)＋頭数別の較正器を学習して JSON 保存(wide較正の新設)")
+    p_fc.add_argument("--win-model", required=True)
+    p_fc.add_argument("--place-model", required=True)
+    p_fc.add_argument("--source", choices=("live", "confirmed"), default="confirmed")
+    p_fc.add_argument("--samples", type=int, default=None)
+    p_fc.add_argument("--cal-from", required=True, help="較正期間 開始 YYYYMMDD")
+    p_fc.add_argument("--cal-to", required=True, help="較正期間 終了 YYYYMMDD")
+    p_fc.add_argument("--bet-types", default="trio,wide", help="較正する券種(カンマ区切り)")
+    p_fc.add_argument("--no-by-field", action="store_true", help="頭数バケット別を作らない(全体のみ)")
+    p_fc.add_argument("--min-bucket-n", type=int, default=300,
+                      help="バケット別較正に必要な最小サンプル(未満は不採用→全体にフォールバック)")
+    p_fc.add_argument("--max-odds", type=float, default=None, help="収集時のオッズ上限(例2000)")
+    p_fc.add_argument("--ev-lcb-z", type=float, default=None,
+                      help="決定時と同じzを渡す(較正の整合性のため)")
+    p_fc.add_argument("--workers", type=int, default=1)
+    p_fc.add_argument("--no-progress", action="store_true")
+    p_fc.add_argument("--out", required=True, help="出力 JSON パス")
+    p_fc.set_defaults(func=_cmd_fit_calib)
 
     p_pc = sub.add_parser("pair-correct",
                           help="ペア相関補正(wide): PL残差をペア特徴で学習し PL と logloss/ROI 比較")
