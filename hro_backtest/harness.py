@@ -58,6 +58,37 @@ def betting_config(source: str, *, min_er=None, min_prob=None, max_odds_age=None
     )
 
 
+def check_oos_window(model_path: str, d_from: str, d_to: str, *,
+                    purpose: str = "評価", allow_insample: bool = False) -> None:
+    """窓がモデルの学習期間と重なっていないか検査する（インサンプル評価の事故防止）。
+
+    ★このプロジェクトで2度踏んだ罠: 学習期間を評価/較正に使うと ROI が数倍に見える。
+      - 評価(backtest/sweep): 窓は test_from 以降であるべき。
+      - 較正(fit-calib): 最低でも valid_from 以降（valid はモデル選択に使うが学習はしていない）。
+    allow_insample=True で警告のみに落とす（意図的な in-sample 診断用）。
+    """
+    try:
+        meta = ModelBundle.load(model_path).meta
+    except Exception as e:  # モデルが読めないなら検査自体をスキップ
+        print(f"[oos-check] スキップ({type(e).__name__})")
+        return
+    vf, tf = getattr(meta, "valid_from", None), getattr(meta, "test_from", None)
+    print(f"[oos-check] model: train→{vf} / valid {vf}..{tf} / test {tf}以降  窓={d_from}..{d_to}")
+    if vf and d_from < vf:
+        msg = (f"★リーク警告: {purpose}窓の開始 {d_from} がモデルの学習期間内(<valid_from {vf})です。"
+               f" 学習データで{purpose}すると ROI が過大に出ます。"
+               f" 評価は test_from({tf})以降、較正は valid_from({vf})以降を使ってください。")
+        if allow_insample:
+            print("  " + msg + " [--allow-insample のため続行]")
+        else:
+            raise SystemExit("  " + msg + "\n  意図的なら --allow-insample を付けてください。")
+    elif tf and d_from < tf:
+        print(f"  注意: 窓が valid 期間({vf}..{tf})に掛かっています。"
+              f" 較正なら可、最終評価なら test_from({tf})以降を推奨。")
+    else:
+        print("  OK: 窓は完全に out-of-sample です。")
+
+
 def load_models(win_path: str, place_path: str) -> tuple[ModelBundle, ModelBundle]:
     """win/place バンドルを読み、現スキーマ一致と役割(target)を検証して返す。"""
     cur_hash = feature_schema_hash()

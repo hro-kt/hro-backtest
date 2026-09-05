@@ -42,6 +42,8 @@ def _add_common(p: argparse.ArgumentParser) -> None:
                    help="券種別確率較正の JSON パス（fit-trio-calib 出力。EV 前に適用）")
     p.add_argument("--ev-lcb-z", type=float, default=None,
                    help="EV下側信頼限界のz(既定0=従来)。walk-forwardで最適zを探る")
+    p.add_argument("--allow-insample", action="store_true",
+                   help="窓がモデルの学習期間と重なっていても続行(既定は中断=リーク事故防止)")
 
 
 def _cmd_run(args) -> int:
@@ -105,6 +107,8 @@ def _fmt(s) -> str:
 def _cmd_backtest(args) -> int:
     from . import harness
 
+    harness.check_oos_window(args.win_model, args.d_from, args.d_to,
+                             purpose="評価", allow_insample=getattr(args, "allow_insample", False))
     calib = None
     if args.trio_calib:
         from hro_optimizer.calibration import load_calibrators
@@ -183,6 +187,8 @@ def _cmd_sweep(args) -> int:
 
     er_grid = _floats(args.er)
     prob_grid = _floats(args.prob)
+    harness.check_oos_window(args.win_model, args.cal_from, args.cal_to,
+                             purpose="較正", allow_insample=getattr(args, "allow_insample", False))
     bet_types = tuple(x.strip() for x in args.bet_types.split(",") if x.strip())
     calib = None
     if args.trio_calib:
@@ -195,11 +201,13 @@ def _cmd_sweep(args) -> int:
         if not (args.win_model and args.place_model and args.d_from and args.d_to):
             raise SystemExit("collect には --win-model/--place-model/--from/--to が必須"
                              "（再スライスのみなら --load-candidates を使用）")
+        harness.check_oos_window(args.win_model, args.d_from, args.d_to,
+                                 purpose="評価", allow_insample=getattr(args, "allow_insample", False))
         settled = harness.collect_settled_candidates(
             args.d_from, args.d_to, args.win_model, args.place_model,
             source=args.source, samples=args.samples, limit=args.limit,
             show_progress=not args.no_progress, bet_types=bet_types, prob_calibrators=calib,
-            max_odds=args.max_odds, workers=args.workers, ev_lcb_z=args.ev_lcb_z,
+            max_odds=args.max_odds, workers=args.workers, ev_lcb_z=getattr(args, "ev_lcb_z", None),
         )
         if args.save_candidates:
             _write_candidates(args.save_candidates, settled)
@@ -543,6 +551,10 @@ def main(argv: list[str] | None = None) -> int:
                       help="collect 結果(候補)を CSV 保存。後で --load-candidates で即再スライス")
     p_sw.add_argument("--load-candidates", default=None,
                       help="保存済み候補 CSV から読む（collect を省略＝grid/ref/帯の再スライスが一瞬）")
+    p_sw.add_argument("--ev-lcb-z", type=float, default=None,
+                      help="EV下側信頼限界のz(既定0=従来)。確率自体を変えるので収集時に適用")
+    p_sw.add_argument("--allow-insample", action="store_true",
+                      help="窓がモデルの学習期間と重なっていても続行(既定は中断)")
     p_sw.set_defaults(func=_cmd_sweep)
 
     p_pt = sub.add_parser("points",
@@ -626,6 +638,8 @@ def main(argv: list[str] | None = None) -> int:
                       help="決定時と同じzを渡す(較正の整合性のため)")
     p_fc.add_argument("--workers", type=int, default=1)
     p_fc.add_argument("--no-progress", action="store_true")
+    p_fc.add_argument("--allow-insample", action="store_true",
+                      help="較正窓が学習期間と重なっていても続行(既定は中断)")
     p_fc.add_argument("--out", required=True, help="出力 JSON パス")
     p_fc.set_defaults(func=_cmd_fit_calib)
 
