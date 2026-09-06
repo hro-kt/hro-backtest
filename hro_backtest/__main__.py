@@ -187,8 +187,6 @@ def _cmd_sweep(args) -> int:
 
     er_grid = _floats(args.er)
     prob_grid = _floats(args.prob)
-    harness.check_oos_window(args.win_model, args.cal_from, args.cal_to,
-                             purpose="較正", allow_insample=getattr(args, "allow_insample", False))
     bet_types = tuple(x.strip() for x in args.bet_types.split(",") if x.strip())
     calib = None
     if args.trio_calib:
@@ -353,6 +351,9 @@ def _cmd_fit_calib(args) -> int:
     """券種別(trio/wide)＋頭数バケット別の較正器を学習して JSON 保存。"""
     import json
     from . import harness
+
+    harness.check_oos_window(args.win_model, args.cal_from, args.cal_to,
+                             purpose="較正", allow_insample=getattr(args, "allow_insample", False))
 
     bet_types = tuple(x.strip() for x in args.bet_types.split(",") if x.strip())
     print(f"=== fit-calib [{args.cal_from}..{args.cal_to}] bet_types={bet_types} "
