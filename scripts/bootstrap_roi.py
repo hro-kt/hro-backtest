@@ -4,6 +4,11 @@
 リサンプルしないとCIが不当に狭くなる(=偶然を有意と誤認する)。
 
     python scripts/bootstrap_roi.py ~/cand2026_base.csv --bet-type wide --min-er 1.7 --min-prob 0.10
+
+複数窓をプールすると n が増えて CI が縮む(窓は独立なので、単一窓で足りない検出力を稼げる):
+
+    python scripts/bootstrap_roi.py ~/cand2025_base.csv ~/cand2026_base.csv \
+        --bet-type wide --min-er 1.7 --min-prob 0.10
 """
 from __future__ import annotations
 
@@ -13,7 +18,7 @@ import random
 from collections import defaultdict
 
 
-def load(path: str) -> list[tuple]:
+def load(path: str, tag: str = "") -> list[tuple]:
     rows = []
     with open(path, encoding="utf-8") as f:
         r = csv.reader(f)
@@ -23,13 +28,14 @@ def load(path: str) -> list[tuple]:
             rid = row[9] if len(row) > 9 else ""
             if st != "True":
                 continue
-            rows.append((bt, float(er), float(prob), float(odds), int(pay), rid))
+            # race_id は窓をまたぐと衝突しうるので、ファイル別にプレフィックスする
+            rows.append((bt, float(er), float(prob), float(odds), int(pay), f"{tag}|{rid}"))
     return rows
 
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("path")
+    ap.add_argument("path", nargs="+", help="候補CSV(複数指定でプール検定)")
     ap.add_argument("--bet-type", required=True)
     ap.add_argument("--min-er", type=float, default=0.0)
     ap.add_argument("--max-er", type=float, default=None)
@@ -39,7 +45,8 @@ def main() -> int:
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    sel = [t for t in load(args.path)
+    allrows = [r for i, p in enumerate(args.path) for r in load(p, tag=str(i))]
+    sel = [t for t in allrows
            if t[0] == args.bet_type and t[1] >= args.min_er and t[2] >= args.min_prob
            and (args.max_er is None or t[1] < args.max_er)
            and (args.max_odds is None or t[3] <= args.max_odds)]
@@ -71,7 +78,7 @@ def main() -> int:
     hi = stats[int(0.975 * args.iters)]
     p_le1 = sum(1 for x in stats if x <= 1.0) / args.iters
 
-    print(f"{args.path}")
+    print("  ".join(args.path))
     print(f"  cell: {args.bet_type} er>={args.min_er}"
           f"{'' if args.max_er is None else f'(<{args.max_er})'} prob>={args.min_prob}")
     print(f"  bets={n_bets}  races={k}  hits={hits} ({hits / n_bets:.1%})")
