@@ -40,7 +40,12 @@ def main() -> int:
     ap.add_argument("--min-er", type=float, default=0.0)
     ap.add_argument("--max-er", type=float, default=None)
     ap.add_argument("--min-prob", type=float, default=0.0)
+    ap.add_argument("--max-prob", type=float, default=None,
+                    help="確率上限。--min-prob と組んで確率帯を切る(市場価格を固定した比較用)")
     ap.add_argument("--max-odds", type=float, default=None)
+    ap.add_argument("--min-odds", type=float, default=None,
+                    help="オッズ下限。--max-odds と組んでオッズ帯を固定し、その中で確率帯を動かすと"
+                         "「市場価格が同じでモデル確率だけ違う」比較になる=市場超えの情報があるかの本質的検定")
     ap.add_argument("--iters", type=int, default=10_000)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -49,6 +54,8 @@ def main() -> int:
     sel = [t for t in allrows
            if t[0] == args.bet_type and t[1] >= args.min_er and t[2] >= args.min_prob
            and (args.max_er is None or t[1] < args.max_er)
+           and (args.max_prob is None or t[2] < args.max_prob)
+           and (args.min_odds is None or t[3] >= args.min_odds)
            and (args.max_odds is None or t[3] <= args.max_odds)]
     if not sel:
         print("該当なし")
@@ -79,8 +86,15 @@ def main() -> int:
     p_le1 = sum(1 for x in stats if x <= 1.0) / args.iters
 
     print("  ".join(args.path))
+    band = "" if args.min_odds is None and args.max_odds is None else \
+        f" odds[{args.min_odds or 0}..{args.max_odds if args.max_odds is not None else '∞'}]"
     print(f"  cell: {args.bet_type} er>={args.min_er}"
-          f"{'' if args.max_er is None else f'(<{args.max_er})'} prob>={args.min_prob}")
+          f"{'' if args.max_er is None else f'(<{args.max_er})'} prob>={args.min_prob}"
+          f"{'' if args.max_prob is None else f'(<{args.max_prob})'}{band}")
+    odds = [t[3] for t in sel]
+    print(f"  odds: mean={sum(odds) / len(odds):.2f} "
+          f"min={min(odds):.1f} max={max(odds):.1f}   "
+          f"(帯を固定した比較では mean が両群で揃っていることを必ず確認する)")
     print(f"  bets={n_bets}  races={k}  hits={hits} ({hits / n_bets:.1%})")
     print(f"  ROI = {roi:.3f}   95%CI [{lo:.3f}, {hi:.3f}]   P(ROI<=1.0) = {p_le1:.3f}")
     return 0
