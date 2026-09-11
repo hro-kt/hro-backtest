@@ -42,7 +42,10 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("path", nargs="+")
     ap.add_argument("--bet-type", required=True)
-    ap.add_argument("--bins", type=int, default=10, help="オッズ十分位の分割数(既定10)")
+    ap.add_argument("--bins", type=int, default=10, help="オッズ分位の分割数(既定10)")
+    ap.add_argument("--prob-bins", type=int, default=2,
+                    help="各オッズ帯の中で確率を何分位に切るか(既定2=中央値二分)。"
+                         "上げると上位分位に絞った時にROIが1.0を越えるかが見える")
     ap.add_argument("--min-prob", type=float, default=0.0, help="事前フィルタ(運用帯に絞りたいとき)")
     ap.add_argument("--max-odds", type=float, default=None)
     ap.add_argument("--iters", type=int, default=10_000)
@@ -70,38 +73,58 @@ def main() -> int:
     buckets: dict[int, list[tuple]] = defaultdict(list)
     for t in rows:
         buckets[bucket_of(t[1])].append(t)
-    med = {b: median(t[0] for t in v) for b, v in buckets.items()}
+    # 各オッズ帯の中で確率の分位境界を決める(全データで一度だけ。以降は固定)
+    Q = args.prob_bins
+    pedges: dict[int, list[float]] = {}
+    for b, v in buckets.items():
+        ps = sorted(t[0] for t in v)
+        pedges[b] = [ps[int(len(ps) * i / Q)] for i in range(1, Q)]
 
-    # 各点に (bucket, is_high) を付けてレース単位にまとめる
-    by_race: dict[str, list[tuple[bool, int]]] = defaultdict(list)
+    def qbin_of(b: int, prob: float) -> int:
+        q = 0
+        for e in pedges[b]:
+            if prob < e:
+                break
+            q += 1
+        return min(q, Q - 1)
+
+    med = {b: (pedges[b][Q // 2 - 1] if Q > 1 else median(t[0] for t in v))
+           for b, v in buckets.items()}
+
+    # 各点に (bucket, qbin) を付けてレース単位にまとめる
+    by_race: dict[str, list[tuple[int, int]]] = defaultdict(list)
     for prob, odds, pay, rid in rows:
         b = bucket_of(odds)
-        by_race[rid].append((prob >= med[b], pay))
+        by_race[rid].append((qbin_of(b, prob), pay))
     races = list(by_race.values())
 
     print(f"{args.bet_type}: bets={len(rows)} races={len(races)} bins={args.bins}"
           f"{'' if args.min_prob == 0 else f' (prob>={args.min_prob} で事前フィルタ)'}")
-    print(f"\n{'odds帯':>16} {'n':>7} {'p中央値':>8} {'ROI高prob':>10} {'ROI低prob':>10} {'差':>8}")
+    hdr = "".join(f"{f'q{q + 1}':>12}" for q in range(Q))
+    print(f"\n各オッズ帯の中を確率で{Q}分位(q1=低prob … q{Q}=高prob)。セル='ROI(n)'")
+    print(f"{'odds帯':>16} {'n':>8}{hdr}")
     lo_edge = 0.0
     for b in sorted(buckets):
         v = buckets[b]
-        hi = [t for t in v if t[0] >= med[b]]
-        lo = [t for t in v if t[0] < med[b]]
         hi_edge = edges[b] if b < len(edges) else float("inf")
-        r_hi = sum(t[2] for t in hi) / (100 * len(hi)) if hi else float("nan")
-        r_lo = sum(t[2] for t in lo) / (100 * len(lo)) if lo else float("nan")
-        print(f"{lo_edge:7.1f}-{hi_edge:7.1f} {len(v):>7,} {med[b]:>8.3f} "
-              f"{r_hi:>10.3f} {r_lo:>10.3f} {r_hi - r_lo:>+8.3f}")
+        cells = ""
+        for q in range(Q):
+            g = [t for t in v if qbin_of(b, t[0]) == q]
+            r = sum(t[2] for t in g) / (100 * len(g)) if g else float("nan")
+            cells += f"{r:>7.3f}({len(g) // 1000:>3}k)" if len(g) >= 1000 else \
+                     f"{r:>7.3f}({len(g):>4})"
+        print(f"{lo_edge:7.1f}-{hi_edge:7.1f} {len(v):>8,}{cells}")
         lo_edge = hi_edge
 
     # レース単位に先に集計してから numpy でベクトル化する。
     # 1反復ごとに全馬券を舐めると iters × bets = 28億回になって終わらない。
     import numpy as np
 
-    sh = np.array([sum(100 for h, _ in r if h) for r in races], dtype=np.float64)
-    ph = np.array([sum(p for h, p in r if h) for r in races], dtype=np.float64)
-    sl = np.array([sum(100 for h, _ in r if not h) for r in races], dtype=np.float64)
-    pl = np.array([sum(p for h, p in r if not h) for r in races], dtype=np.float64)
+    top = Q - 1
+    sh = np.array([sum(100 for q, _ in r if q == top) for r in races], dtype=np.float64)
+    ph = np.array([sum(p for q, p in r if q == top) for r in races], dtype=np.float64)
+    sl = np.array([sum(100 for q, _ in r if q < top) for r in races], dtype=np.float64)
+    pl = np.array([sum(p for q, p in r if q < top) for r in races], dtype=np.float64)
 
     rh = ph.sum() / sh.sum()
     rl = pl.sum() / sl.sum()
@@ -123,8 +146,23 @@ def main() -> int:
     hi_ci = float(diffs[int(0.975 * args.iters)])
     p_le0 = float((diffs <= 0.0).mean())
 
-    print(f"\nプール: ROI(高prob)={rh:.3f}  ROI(低prob)={rl:.3f}")
+    # 最上位分位そのものが 1.0 を越えるか(=買える領域があるか)も同時に出す
+    out_h = np.empty(args.iters, dtype=np.float64)
+    rng2 = np.random.default_rng(args.seed + 1)
+    done = 0
+    while done < args.iters:
+        m = min(chunk, args.iters - done)
+        idx = rng2.integers(0, k, size=(m, k))
+        out_h[done:done + m] = ph[idx].sum(1) / sh[idx].sum(1)
+        done += m
+    hs = np.sort(out_h)
+    h_lo, h_hi = float(hs[int(0.025 * args.iters)]), float(hs[int(0.975 * args.iters)])
+    p_h_le1 = float((hs <= 1.0).mean())
+
+    print(f"\nプール: ROI(最上位q{Q})={rh:.3f}  ROI(それ以外)={rl:.3f}")
     print(f"  差 = {d:+.3f}   95%CI [{lo_ci:+.3f}, {hi_ci:+.3f}]   P(差<=0) = {p_le0:.3f}")
+    print(f"  最上位q{Q}の水準: ROI={rh:.3f}  95%CI [{h_lo:.3f}, {h_hi:.3f}]  "
+          f"P(ROI<=1.0)={p_h_le1:.3f}")
     print("\n  差>0 が有意 → 同じ市場価格でモデルは市場より当たりを見分けている(=市場超えの情報あり)。")
     print("  差≒0        → モデルは市場価格を再現しているだけ。prob でROIが動くのは人気馬バイアス。")
     return 0
