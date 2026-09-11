@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import random
 from collections import defaultdict
 from statistics import median
 
@@ -95,28 +94,34 @@ def main() -> int:
               f"{r_hi:>10.3f} {r_lo:>10.3f} {r_hi - r_lo:>+8.3f}")
         lo_edge = hi_edge
 
-    def pooled(rs) -> tuple[float, float, float]:
-        sh = ph = sl = pl = 0
-        for r in rs:
-            for is_high, pay in r:
-                if is_high:
-                    sh += 100; ph += pay
-                else:
-                    sl += 100; pl += pay
-        rh = ph / sh if sh else float("nan")
-        rl = pl / sl if sl else float("nan")
-        return rh, rl, rh - rl
+    # レース単位に先に集計してから numpy でベクトル化する。
+    # 1反復ごとに全馬券を舐めると iters × bets = 28億回になって終わらない。
+    import numpy as np
 
-    rh, rl, d = pooled(races)
-    rnd = random.Random(args.seed)
+    sh = np.array([sum(100 for h, _ in r if h) for r in races], dtype=np.float64)
+    ph = np.array([sum(p for h, p in r if h) for r in races], dtype=np.float64)
+    sl = np.array([sum(100 for h, _ in r if not h) for r in races], dtype=np.float64)
+    pl = np.array([sum(p for h, p in r if not h) for r in races], dtype=np.float64)
+
+    rh = ph.sum() / sh.sum()
+    rl = pl.sum() / sl.sum()
+    d = rh - rl
+
+    rng = np.random.default_rng(args.seed)
     k = len(races)
-    diffs = []
-    for _ in range(args.iters):
-        diffs.append(pooled([races[rnd.randrange(k)] for _ in range(k)])[2])
-    diffs.sort()
-    lo_ci = diffs[int(0.025 * args.iters)]
-    hi_ci = diffs[int(0.975 * args.iters)]
-    p_le0 = sum(1 for x in diffs if x <= 0.0) / args.iters
+    out = np.empty(args.iters, dtype=np.float64)
+    chunk = max(1, min(200, args.iters))   # (chunk × k) の添字行列に収まる粒度
+    done = 0
+    while done < args.iters:
+        m = min(chunk, args.iters - done)
+        idx = rng.integers(0, k, size=(m, k))
+        out[done:done + m] = (ph[idx].sum(1) / sh[idx].sum(1)
+                              - pl[idx].sum(1) / sl[idx].sum(1))
+        done += m
+    diffs = np.sort(out)
+    lo_ci = float(diffs[int(0.025 * args.iters)])
+    hi_ci = float(diffs[int(0.975 * args.iters)])
+    p_le0 = float((diffs <= 0.0).mean())
 
     print(f"\nプール: ROI(高prob)={rh:.3f}  ROI(低prob)={rl:.3f}")
     print(f"  差 = {d:+.3f}   95%CI [{lo_ci:+.3f}, {hi_ci:+.3f}]   P(差<=0) = {p_le0:.3f}")

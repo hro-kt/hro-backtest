@@ -14,7 +14,6 @@ from __future__ import annotations
 
 import argparse
 import csv
-import random
 from collections import defaultdict
 
 
@@ -70,20 +69,25 @@ def main() -> int:
     stake = 100 * n_bets
     roi = sum(t[4] for t in sel) / stake
 
-    rnd = random.Random(args.seed)
+    # レース単位に集計してから numpy でベクトル化(1反復ごとに全馬券を舐めると終わらない)
+    import numpy as np
+
+    st = np.array([100 * len(r) for r in races], dtype=np.float64)
+    pa = np.array([sum(r) for r in races], dtype=np.float64)
+    rng = np.random.default_rng(args.seed)
     k = len(races)
-    stats = []
-    for _ in range(args.iters):
-        s = p = 0
-        for _ in range(k):
-            r = races[rnd.randrange(k)]
-            s += 100 * len(r)
-            p += sum(r)
-        stats.append(p / s)
-    stats.sort()
-    lo = stats[int(0.025 * args.iters)]
-    hi = stats[int(0.975 * args.iters)]
-    p_le1 = sum(1 for x in stats if x <= 1.0) / args.iters
+    out = np.empty(args.iters, dtype=np.float64)
+    chunk = max(1, min(200, args.iters))
+    done = 0
+    while done < args.iters:
+        m = min(chunk, args.iters - done)
+        idx = rng.integers(0, k, size=(m, k))
+        out[done:done + m] = pa[idx].sum(1) / st[idx].sum(1)
+        done += m
+    stats = np.sort(out)
+    lo = float(stats[int(0.025 * args.iters)])
+    hi = float(stats[int(0.975 * args.iters)])
+    p_le1 = float((stats <= 1.0).mean())
 
     print("  ".join(args.path))
     band = "" if args.min_odds is None and args.max_odds is None else \
