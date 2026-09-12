@@ -22,15 +22,26 @@ END_YEAR="${END_YEAR:-2026}"
 END_DATE_LAST="${END_DATE_LAST:-20260827}"   # 最終年はデータ終端まで
 WF_DIR="${WF_DIR:-$HOME/wf}"
 BET_TYPES="${BET_TYPES:-wide,place}"         # trio は2窓OOSで棄却済(0.72/0.52)なので既定で外す
+# ★収集コストの大半はワイドの組み合わせ(7窓で wide 2,014,574本 vs place 276,588本)。
+#   アブレーション比較など複勝だけ見ればよい実験では BET_TYPES=place で大幅に速くなる。
 WORKERS="${WORKERS:-3}"
 ER_GRID="${ER_GRID:-1.0,1.3,1.5,1.7,2.0}"
 PROB_GRID="${PROB_GRID:-0.00,0.05,0.10}"
 MAX_ODDS="${MAX_ODDS:-2000}"
 
-if [ -z "${HRO_ABLATE_SED:-}" ]; then
+# アブレーション未設定のまま回すと、本番と違う特徴スキーマのモデルが黙って出来上がる。
+# 事故防止のため既定では拒否し、意図的な全解除は ALLOW_NO_ABLATION=1 で明示させる。
+# ★2026-09: ~/prod_env.sh の11フラグ(SED/PEDCOND等)は、evidence-baseline で無効と
+#   整理した4年窓/汚染データ時代の証拠で決めたもの。全解除版と比較する実験のために
+#   この経路が要る。
+if [ -z "${HRO_ABLATE_SED:-}" ] && [ "${ALLOW_NO_ABLATION:-}" != "1" ]; then
   echo "!! ablation env が未設定です。'source ~/prod_env.sh' を先に実行してください。" >&2
   echo "   (特徴スキーマが変わり ModelBundle.assert_compatible で落ちます)" >&2
+  echo "   意図的に全特徴で回すなら ALLOW_NO_ABLATION=1 を付けてください。" >&2
   exit 1
+fi
+if [ "${ALLOW_NO_ABLATION:-}" = "1" ] && [ -z "${HRO_ABLATE_SED:-}" ]; then
+  echo "※ アブレーション全解除で実行します(本番11フラグとは別スキーマ)。"
 fi
 
 mkdir -p "$WF_DIR"
