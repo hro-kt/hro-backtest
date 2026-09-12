@@ -25,7 +25,7 @@ from collections import defaultdict
 import numpy as np
 
 
-def load(paths: list[str], bet_type: str) -> list[tuple]:
+def load(paths: list[str], bet_type: str, max_career=None, min_career=None) -> list[tuple]:
     rows = []
     for path in paths:
         with open(path, encoding="utf-8") as f:
@@ -35,8 +35,10 @@ def load(paths: list[str], bet_type: str) -> list[tuple]:
                 bt, er, prob, odds, st, _hit, pay = row[:7]
                 if bt != bet_type or st != "True":
                     continue
+                runs = row[7] if len(row) > 7 else ""
                 rows.append((float(prob), float(odds), int(pay),
-                             row[9] if len(row) > 9 else "", float(er)))
+                             row[9] if len(row) > 9 else "", float(er),
+                             int(runs) if runs not in ("", "None") else None))
     return rows
 
 
@@ -77,11 +79,25 @@ def main() -> int:
     ap.add_argument("--cell", action="store_true", help="分位でなく er/prob 閾値で選ぶ")
     ap.add_argument("--min-er", type=float, default=0.0)
     ap.add_argument("--min-prob", type=float, default=0.0)
+    ap.add_argument("--max-career", type=int, default=None,
+                    help="馬のキャリア本数(h_n_2y)がこれ以下のみ。新馬=0。血統が効くはずの土俵")
+    ap.add_argument("--min-career", type=int, default=None, help="キャリア本数の下限")
     ap.add_argument("--iters", type=int, default=10_000)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
-    A, B = load(args.a, args.bet_type), load(args.b, args.bet_type)
+    A = load(args.a, args.bet_type)
+    B = load(args.b, args.bet_type)
+    # 血統は「馬自身の実績が薄い場面」でこそ効くはず(新馬/2走目/初条件)。全レースを
+    # プールすると、そこでの効果が薄まって見えなくなる。キャリアで絞って測れるようにする。
+    if args.max_career is not None or args.min_career is not None:
+        def ok(t):
+            r = t[5]
+            if r is None:
+                return False
+            return ((args.max_career is None or r <= args.max_career)
+                    and (args.min_career is None or r >= args.min_career))
+        A, B = [t for t in A if ok(t)], [t for t in B if ok(t)]
     if not A or not B:
         print(f"データ不足 A={len(A)} B={len(B)}")
         return 1
@@ -121,6 +137,8 @@ def main() -> int:
 
     mode = (f"cell er>={args.min_er} prob>={args.min_prob}" if args.cell
             else f"オッズ{args.odds_bins}分位の中の最上位1/{args.prob_bins}分位")
+    if args.max_career is not None or args.min_career is not None:
+        mode += f"  career[{args.min_career or 0}..{args.max_career if args.max_career is not None else '∞'}]"
     print(f"{args.bet_type}  選別={mode}")
     print(f"  共通レース={k:,}   A(前) 本数={int(st_a.sum() // 100):,}  "
           f"B(後) 本数={int(st_b.sum() // 100):,}")

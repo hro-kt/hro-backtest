@@ -25,10 +25,12 @@ def load(path: str, tag: str = "") -> list[tuple]:
         for row in r:
             bt, er, prob, odds, st, hit, pay = row[:7]
             rid = row[9] if len(row) > 9 else ""
+            runs = row[7] if len(row) > 7 else ""
             if st != "True":
                 continue
             # race_id は窓をまたぐと衝突しうるので、ファイル別にプレフィックスする
-            rows.append((bt, float(er), float(prob), float(odds), int(pay), f"{tag}|{rid}"))
+            rows.append((bt, float(er), float(prob), float(odds), int(pay), f"{tag}|{rid}",
+                         int(runs) if runs not in ("", "None") else None))
     return rows
 
 
@@ -45,6 +47,8 @@ def main() -> int:
     ap.add_argument("--min-odds", type=float, default=None,
                     help="オッズ下限。--max-odds と組んでオッズ帯を固定し、その中で確率帯を動かすと"
                          "「市場価格が同じでモデル確率だけ違う」比較になる=市場超えの情報があるかの本質的検定")
+    ap.add_argument("--max-career", type=int, default=None,
+                    help="馬のキャリア本数(h_n_2y)がこれ以下のみ(新馬=0)。血統が効く土俵の切り出し")
     ap.add_argument("--iters", type=int, default=10_000)
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
@@ -55,7 +59,9 @@ def main() -> int:
            and (args.max_er is None or t[1] < args.max_er)
            and (args.max_prob is None or t[2] < args.max_prob)
            and (args.min_odds is None or t[3] >= args.min_odds)
-           and (args.max_odds is None or t[3] <= args.max_odds)]
+           and (args.max_odds is None or t[3] <= args.max_odds)
+           and (args.max_career is None
+                or (t[6] is not None and t[6] <= args.max_career))]
     if not sel:
         print("該当なし")
         return 1
