@@ -28,6 +28,11 @@ WORKERS="${WORKERS:-3}"
 ER_GRID="${ER_GRID:-1.0,1.3,1.5,1.7,2.0}"
 PROB_GRID="${PROB_GRID:-0.00,0.05,0.10}"
 MAX_ODDS="${MAX_ODDS:-2000}"
+# PLモンテカルロのサンプル数。既定は sweep 側の既定(現行200,000)に委ねる。
+# 200,000 は「フェーズ1」で 50,000 から上げたものだが ROI への効果は未確認で、
+# 複勝確率の標準誤差は p=0.3 のとき 50,000 でも 0.002＝選別に影響しない水準。
+# 実験を速く回したいときは SAMPLES=50000 を指定する(比較する2本で必ず揃えること)。
+SAMPLES="${SAMPLES:-}"
 
 # アブレーション未設定のまま回すと、本番と違う特徴スキーマのモデルが黙って出来上がる。
 # 事故防止のため既定では拒否し、意図的な全解除は ALLOW_NO_ABLATION=1 で明示させる。
@@ -83,6 +88,7 @@ for Y in $(seq "$START_YEAR" "$END_YEAR"); do
         --from "$TEST_FROM" --to "$D_TO" \
         --bet-types "$BET_TYPES" --max-odds "$MAX_ODDS" --workers "$WORKERS" \
         --er "$ER_GRID" --prob "$PROB_GRID" \
+        ${SAMPLES:+--samples "$SAMPLES"} \
         --save-candidates "$CAND" --out "$DIR/grid.csv" \
         > "$DIR/sweep.log" 2>&1; then
       echo "[$Y] !! sweep 失敗。$DIR/sweep.log を確認して中断" >&2
