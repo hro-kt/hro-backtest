@@ -27,16 +27,16 @@ mkdir -p "$WF_A" "$WF_B"
 echo "=== [A] 本番アブレーション有り → $WF_A"; date
 bash -c "source '$PROD_ENV'
   WF_DIR='$WF_A' BET_TYPES=place START_YEAR='$START_YEAR' END_YEAR='$END_YEAR' \
-    bash '$HERE/walkforward.sh'" > "$WF_A/driver.log" 2>&1
-rc=$?
+    bash '$HERE/walkforward.sh'" 2>&1 | tee "$WF_A/driver.log" | grep -E '^\[|^==='
+rc=${PIPESTATUS[0]}
 [ $rc -eq 0 ] || { echo "!! A が失敗($rc)。$WF_A/driver.log" >&2; tail -20 "$WF_A/driver.log" >&2; exit 1; }
 
 echo "=== [B] アブレーション全解除 → $WF_B"; date
 # 親シェルに HRO_ABLATE_* が残っていても確実に外す
 bash -c "for v in \$(env | sed -n 's/^\(HRO_ABLATE_[A-Z]*\)=.*/\1/p'); do unset \"\$v\"; done
   ALLOW_NO_ABLATION=1 WF_DIR='$WF_B' BET_TYPES=place START_YEAR='$START_YEAR' END_YEAR='$END_YEAR' \
-    bash '$HERE/walkforward.sh'" > "$WF_B/driver.log" 2>&1
-rc=$?
+    bash '$HERE/walkforward.sh'" 2>&1 | tee "$WF_B/driver.log" | grep -E '^\[|^==='
+rc=${PIPESTATUS[0]}
 [ $rc -eq 0 ] || { echo "!! B が失敗($rc)。$WF_B/driver.log" >&2; tail -20 "$WF_B/driver.log" >&2; exit 1; }
 
 echo "=== 対応のある比較 (A=アブレーション有り, B=全解除)"; date
