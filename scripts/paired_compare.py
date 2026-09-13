@@ -63,9 +63,9 @@ def select(rows, edges, q, cell, min_er, min_prob):
             thr = ps[int(len(ps) * (q - 1) / q)]   # 上位 1/q 分位の下限
             keep += [x for x in v if x[0] >= thr]
     agg: dict[str, list[int]] = defaultdict(lambda: [0, 0])
-    for _p, _o, pay, rid, _er in keep:
-        agg[rid][0] += 100
-        agg[rid][1] += pay
+    for t in keep:                      # t = (prob, odds, payout, race_id, er, career)
+        agg[t[3]][0] += 100
+        agg[t[3]][1] += t[2]
     return {k: tuple(v) for k, v in agg.items()}
 
 
