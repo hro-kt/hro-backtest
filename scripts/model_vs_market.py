@@ -9,8 +9,12 @@
   食い違ってモデルが正しいビン = 市場が織り込めていない領域(賭ける/強める特徴を作る)
   食い違って市場が正しいビン  = モデルの盲点(直す特徴/足す交互作用)
 
-入力: sweep --save-candidates の候補CSV(place)。prob=モデルp, odds=確定複勝オッズ,
-      市場含意p = 0.80/odds(複勝控除率20%を戻す。粗いが比較の基準としては十分)。
+入力: sweep --save-candidates の候補CSV(place)。prob=モデルp, odds=確定複勝オッズ。
+市場含意p: 生の 0.80/odds は使わない。複勝は下限オッズかつ複数着払いのプールなので、
+      0.80/odds は一様に約4pt高く出て、全ビンが「モデル正」になる(2026-09 実測: 全ビンで
+      実測−市場≈-0.04, モデル≈実測)。それはプロキシの偏りであって市場の誤りではない。
+      そこで 1/odds→的中率 の単調曲線を全体で当て(等頻度ビン+単調化)、較正済み市場pを参照点に
+      する。見えるのは「市場の平均的な較正からビンごとにどれだけ逸脱するか」＝市場の局所誤差。
 特徴: --features 指定、無ければ --bundle の top_importance(gain上位)。
       race_id + 馬番で feat_matrix に結合して取る。
 
@@ -83,6 +87,19 @@ def fetch_features(pairs, cols):
         db.close()
 
 
+def fit_market_calibration(rows, nbins=60):
+    """生の含意p(=0.8/odds)→実測的中率 の単調写像を作る。返り値: f(raw)->較正p と参考点。"""
+    raw = np.array([(1 - TAKEOUT_PLACE) / r[3] for r in rows], dtype=np.float64)
+    hit = np.array([1.0 if r[4] else 0.0 for r in rows], dtype=np.float64)
+    order = np.argsort(raw)
+    raw, hit = raw[order], hit[order]
+    idx = np.array_split(np.arange(len(raw)), nbins)
+    xs = np.array([raw[i].mean() for i in idx])
+    ys = np.maximum.accumulate(np.array([hit[i].mean() for i in idx]))  # 単調化
+    f = lambda x: float(np.interp(x, xs, ys))
+    return f, list(zip(xs, ys))
+
+
 def bins_for(values, max_cat=12, q=8):
     """値→ビンラベル関数。低カーディナリティは値そのまま、数値は分位。"""
     vals = [v for v in values if v is not None]
@@ -135,16 +152,19 @@ def main() -> int:
     if not feats:
         ap.error("--features か --bundle を指定してください")
 
+    mkt, pts = fit_market_calibration(rows)
+    print("  市場pの較正(生0.8/odds → 実測): " + "  ".join(
+        f"{x:.2f}→{y:.3f}" for x, y in [pts[i] for i in (0, len(pts)//4, len(pts)//2, 3*len(pts)//4, -1)]))
     attrs, feats = fetch_features([(r[0], r[1]) for r in rows], feats)
     joined = [(r, attrs.get((r[0], r[1]))) for r in rows]
     joined = [(r, a) for r, a in joined if a is not None]
     print(f"{args.bet_type}: 候補 {len(rows):,} → feat_matrix 結合 {len(joined):,}"
-          f"  (市場含意p = {1 - TAKEOUT_PLACE:.2f}/odds)")
+          f"  (市場p = 較正済み。生 {1 - TAKEOUT_PLACE:.2f}/odds を実測に単調写像)")
 
     def agg(items):
         n = len(items)
         pm = float(np.mean([r[2] for r, _ in items]))
-        pk = float(np.mean([(1 - TAKEOUT_PLACE) / r[3] for r, _ in items]))
+        pk = float(np.mean([mkt((1 - TAKEOUT_PLACE) / r[3]) for r, _ in items]))
         hit = float(np.mean([1.0 if r[4] else 0.0 for r, _ in items]))
         roi = sum(r[5] for r, _ in items) / (100.0 * n)
         return n, pm, pk, hit, roi
@@ -155,7 +175,9 @@ def main() -> int:
         groups = defaultdict(list)
         for r, a in joined:
             groups[f(a[c])].append((r, a))
-        keys = [k for k in (order or sorted(groups)) if k in groups] + (["NA"] if "NA" in groups and "NA" not in (order or []) else [])
+        keys = [k for k in (order or sorted(groups)) if k in groups]
+        if "NA" in groups and "NA" not in keys:
+            keys.append("NA")
         print(f"\n[{c}]")
         print(f"  {'bin':<18}{'n':>7}{'モデルp':>9}{'市場p':>8}{'実測':>8}{'ROI':>7}   モデル−市場  実測−市場  判定")
         model_right = market_right = 0
