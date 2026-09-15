@@ -47,6 +47,9 @@ def main() -> int:
                     help="各オッズ帯の中で確率を何分位に切るか(既定2=中央値二分)。"
                          "上げると上位分位に絞った時にROIが1.0を越えるかが見える")
     ap.add_argument("--min-prob", type=float, default=0.0, help="事前フィルタ(運用帯に絞りたいとき)")
+    ap.add_argument("--score", choices=("model", "market"), default="model",
+                    help="market: 確率を 1/odds に置き換える negative control。帯内の順位付けが"
+                         "純粋な人気-穴バイアスだけでどれだけの差を生むかを測る(外部レビュー P0)")
     ap.add_argument("--max-odds", type=float, default=None)
     ap.add_argument("--iters", type=int, default=10_000)
     ap.add_argument("--seed", type=int, default=42)
@@ -54,6 +57,11 @@ def main() -> int:
 
     rows = [t for t in load(args.path, args.bet_type)
             if t[0] >= args.min_prob and (args.max_odds is None or t[1] <= args.max_odds)]
+    if args.score == "market":
+        # モデル確率を捨て、市場だけの順位付け(1/odds)にする。帯の中でこれが正の差を出すなら、
+        # その分は「同一帯内でも人気馬ほどROIが高い」バイアスであり、モデル情報ではない。
+        rows = [(1.0 / t[1], t[1], t[2], t[3]) for t in rows]
+        print("※ negative control: score = 1/odds(市場のみ)")
     if len(rows) < 200:
         print(f"データ不足: {len(rows)}")
         return 1
@@ -113,7 +121,13 @@ def main() -> int:
             r = sum(t[2] for t in g) / (100 * len(g)) if g else float("nan")
             cells += f"{r:>7.3f}({len(g) // 1000:>3}k)" if len(g) >= 1000 else \
                      f"{r:>7.3f}({len(g):>4})"
-        print(f"{lo_edge:7.1f}-{hi_edge:7.1f} {len(v):>8,}{cells}")
+        # 帯内の人気-穴バイアス監査: 最上位分位とそれ以外の平均オッズ。差が大きい帯ほど
+        # ROI差にバイアスが混ざる。--bins を増やして差が消えるかを見る。
+        top = [t[1] for t in v if qbin_of(b, t[0]) == Q - 1]
+        rest = [t[1] for t in v if qbin_of(b, t[0]) < Q - 1]
+        mo = (f"  odds top/rest={sum(top)/len(top):.2f}/{sum(rest)/len(rest):.2f}"
+              if top and rest else "")
+        print(f"{lo_edge:7.1f}-{hi_edge:7.1f} {len(v):>8,}{cells}{mo}")
         lo_edge = hi_edge
 
     # レース単位に先に集計してから numpy でベクトル化する。

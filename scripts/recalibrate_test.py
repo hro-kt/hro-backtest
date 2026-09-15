@@ -58,6 +58,42 @@ def pav(x, y):
     return ux, fitted[idx]
 
 
+class Benter:
+    """logit(p*) = a + b·logit(q_market) + c·logit(p_fund) を fit 窓で当てる2入力ロジスティック。
+
+    外部レビュー(2026-09) P1: 427特徴+市場を GBM に混ぜるのではなく、市場を見せずに作った
+    fundamental score を1本の独立した score として凍結し、市場と meta model で統合する
+    (Benter 1994 の2段階)。これなら「市場が強すぎて木が自前の信号を捨てる」問題は起きない。
+    init_score は b=1 を強制していたが、市場較正が完全でないならその制約は不要。
+    q_market は生の 0.8/odds(較正は a,b が吸収する)。IRLS で3パラメータを推定。
+    """
+    def __init__(self, rows):
+        X = np.column_stack([np.ones(len(rows)),
+                             _logit([0.8 / o for _p, o, _h, _pay, _rid in rows]),
+                             _logit([p for p, _o, _h, _pay, _rid in rows])])
+        y = np.array([h for _p, _o, h, _pay, _rid in rows])
+        w = np.zeros(3)
+        for _ in range(50):
+            z = X @ w; mu = 1 / (1 + np.exp(-z)); W = mu * (1 - mu) + 1e-9
+            g = X.T @ (y - mu); H = (X * W[:, None]).T @ X + 1e-6 * np.eye(3)
+            step = np.linalg.solve(H, g); w += step
+            if np.abs(step).max() < 1e-8:
+                break
+        self.w = w
+
+    def __call__(self, p, o):
+        z = self.w[0] + self.w[1] * _logit1(0.8 / o) + self.w[2] * _logit1(p)
+        return float(1 / (1 + np.exp(-z)))
+
+
+def _logit1(x, lo=1e-6, hi=1 - 1e-6):
+    x = min(max(float(x), lo), hi); return np.log(x / (1 - x))
+
+
+def _logit(xs, lo=1e-6, hi=1 - 1e-6):
+    a = np.clip(np.asarray(xs, dtype=np.float64), lo, hi); return np.log(a / (1 - a))
+
+
 class Recal:
     def __init__(self, rows, by_band):
         self.by_band = by_band
@@ -119,9 +155,12 @@ def main() -> int:
     raw = lambda p, o: p
     rec_g = Recal(fit_rows, by_band=False)
     rec_b = Recal(fit_rows, by_band=True)
+    ben = Benter(fit_rows)
+    print(f"  Benter: logit(p*) = {ben.w[0]:+.3f} + {ben.w[1]:.3f}·logit(q_market) + {ben.w[2]:.3f}·logit(p_fund)")
+    print("         (c/b が fundamental の相対重み。init_score は b=1 固定だった)")
 
     # 較正の効き(evalの運用点付近): 平均p vs 的中率
-    for name, fn in (("生", raw), ("全体再較正", rec_g), ("オッズ帯再較正", rec_b)):
+    for name, fn in (("生", raw), ("全体再較正", rec_g), ("オッズ帯再較正", rec_b), ("Benter", ben)):
         sel = [(fn(p, o), h) for p, o, h, _pay, _rid in ev_rows if fn(p, o) >= args.min_prob]
         if sel:
             print(f"  {name:<8} prob>={args.min_prob}: n={len(sel):>6,}  平均p={np.mean([s[0] for s in sel]):.3f}"
@@ -129,13 +168,13 @@ def main() -> int:
 
     aggR, nR = race_agg(ev_rows, raw, args.min_prob)
     print(f"\n[閾値 prob>={args.min_prob}]  生: n={nR:,}")
-    for name, fn in (("全体再較正", rec_g), ("オッズ帯再較正", rec_b)):
+    for name, fn in (("全体再較正", rec_g), ("オッズ帯再較正", rec_b), ("Benter", ben)):
         aggX, nX = race_agg(ev_rows, fn, args.min_prob)
         ra, rb, d, lo, hi, p = paired(aggR, aggX)
         print(f"  {name:<8} n={nX:,}  ROI 生={ra:.4f} → {rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={p:.3f}")
 
     print(f"\n[同一本数 top-{nR:,}(較正後の確率順)]  ←閾値通過数の変化ではなく順位付けの変化だけを見る")
-    for name, fn in (("全体再較正", rec_g), ("オッズ帯再較正", rec_b)):
+    for name, fn in (("全体再較正", rec_g), ("オッズ帯再較正", rec_b), ("Benter", ben)):
         aggX, _ = race_agg(ev_rows, fn, args.min_prob, top_n=nR)
         ra, rb, d, lo, hi, p = paired(aggR, aggX)
         print(f"  {name:<8} ROI 生={ra:.4f} → {rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={p:.3f}")
