@@ -33,6 +33,11 @@ MAX_ODDS="${MAX_ODDS:-2000}"
 # 複勝確率の標準誤差は p=0.3 のとき 50,000 でも 0.002＝選別に影響しない水準。
 # 実験を速く回したいときは SAMPLES=50000 を指定する(比較する2本で必ず揃えること)。
 SAMPLES="${SAMPLES:-}"
+# init_score(オフセット)学習。市場含意確率(tyb_tan_impprob)のロジットを基準にして残差だけを
+# 学ばせる。市場価格を素の特徴にすると GBM が自前の信号を捨てて市場に寄りかかり、AUCは上がるが
+# ROIが悪化した(市場超え検定の差 +0.149→+0.114)。オフセットならその近道が塞がれる。
+# ★特徴からは外すこと: OFFSET_COL を使うときは HRO_ABLATE_TYBMKT=1 も立てる(呼び出し側で)。
+OFFSET_COL="${OFFSET_COL:-}"
 
 # アブレーション未設定のまま回すと、本番と違う特徴スキーマのモデルが黙って出来上がる。
 # 事故防止のため既定では拒否し、意図的な全解除は ALLOW_NO_ABLATION=1 で明示させる。
@@ -71,6 +76,7 @@ for Y in $(seq "$START_YEAR" "$END_YEAR"); do
     echo "[$Y] train $NAME ($TARGET)"
     if ! poetry run hro-predictor train --target "$TARGET" \
         --valid-from "$VALID_FROM" --test-from "$TEST_FROM" \
+        ${OFFSET_COL:+--offset-col "$OFFSET_COL"} \
         --out "$OUT" > "$DIR/train_${NAME}.log" 2>&1; then
       echo "[$Y] !! train $NAME 失敗。$DIR/train_${NAME}.log を確認して中断" >&2
       tail -20 "$DIR/train_${NAME}.log" >&2
