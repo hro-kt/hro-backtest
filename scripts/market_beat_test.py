@@ -81,29 +81,34 @@ def main() -> int:
     buckets: dict[int, list[tuple]] = defaultdict(list)
     for t in rows:
         buckets[bucket_of(t[1])].append(t)
-    # 各オッズ帯の中で確率の分位境界を決める(全データで一度だけ。以降は固定)
+    # 各オッズ帯の中で確率分位を **順位ベース** で割り当てる(同値はシード付き乱数で分割)。
+    # ★閾値方式(prob >= 境界)だと同値が全部同じ側に落ち、帯ごとに上位群が20%からずれる。
+    #   複勝オッズは0.1刻みで細い帯では同値だらけなので、1/odds を score にした対照では
+    #   帯が細いほど上位群の大きさが帯構成と相関し、プールした ROI差が Simpson 型に膨らんだ
+    #   (10帯 +0.039 → 100帯 +0.130 でモデルと一致、という不自然な挙動の原因)。
+    #   順位割当なら各帯で厳密に 1/Q ずつになり、プール比較の帯構成が上位/それ以外で揃う。
     Q = args.prob_bins
-    pedges: dict[int, list[float]] = {}
+    rng_tie = np.random.default_rng(args.seed + 7)
+    qbin_row: dict[int, int] = {}          # 行index → 分位
     for b, v in buckets.items():
-        ps = sorted(t[0] for t in v)
-        pedges[b] = [ps[int(len(ps) * i / Q)] for i in range(1, Q)]
+        idxs = [i for i, t in enumerate(rows) if bucket_of(t[1]) == b]
+        keys = np.array([rows[i][0] for i in idxs], dtype=np.float64)
+        order = np.lexsort((rng_tie.random(len(idxs)), keys))   # score昇順、同値は乱数
+        n_b = len(idxs)
+        for pos, j in enumerate(order):
+            qbin_row[idxs[j]] = min(Q - 1, (pos * Q) // n_b)
 
-    def qbin_of(b: int, prob: float) -> int:
-        q = 0
-        for e in pedges[b]:
-            if prob < e:
-                break
-            q += 1
-        return min(q, Q - 1)
+    def qbin_of(b: int, prob: float) -> int:  # 表示用の後方互換(帯内の値→分位の近似)
+        ps = sorted(t[0] for t in buckets[b])
+        k = int(np.searchsorted(ps, prob, side="right")) - 1
+        return min(Q - 1, max(0, (k * Q) // max(len(ps), 1)))
 
-    med = {b: (pedges[b][Q // 2 - 1] if Q > 1 else median(t[0] for t in v))
-           for b, v in buckets.items()}
+    med = {b: median(t[0] for t in v) for b, v in buckets.items()}
 
-    # 各点に (bucket, qbin) を付けてレース単位にまとめる
+    # 各点に (qbin, payout) を付けてレース単位にまとめる
     by_race: dict[str, list[tuple[int, int]]] = defaultdict(list)
-    for prob, odds, pay, rid in rows:
-        b = bucket_of(odds)
-        by_race[rid].append((qbin_of(b, prob), pay))
+    for i, (prob, odds, pay, rid) in enumerate(rows):
+        by_race[rid].append((qbin_row[i], pay))
     races = list(by_race.values())
 
     print(f"{args.bet_type}: bets={len(rows)} races={len(races)} bins={args.bins}"
@@ -112,19 +117,22 @@ def main() -> int:
     print(f"\n各オッズ帯の中を確率で{Q}分位(q1=低prob … q{Q}=高prob)。セル='ROI(n)'")
     print(f"{'odds帯':>16} {'n':>8}{hdr}")
     lo_edge = 0.0
+    rows_by_bucket: dict[int, list[int]] = defaultdict(list)
+    for i, t in enumerate(rows):
+        rows_by_bucket[bucket_of(t[1])].append(i)
     for b in sorted(buckets):
         v = buckets[b]
         hi_edge = edges[b] if b < len(edges) else float("inf")
         cells = ""
         for q in range(Q):
-            g = [t for t in v if qbin_of(b, t[0]) == q]
+            g = [rows[i] for i in rows_by_bucket[b] if qbin_row[i] == q]
             r = sum(t[2] for t in g) / (100 * len(g)) if g else float("nan")
             cells += f"{r:>7.3f}({len(g) // 1000:>3}k)" if len(g) >= 1000 else \
                      f"{r:>7.3f}({len(g):>4})"
         # 帯内の人気-穴バイアス監査: 最上位分位とそれ以外の平均オッズ。差が大きい帯ほど
         # ROI差にバイアスが混ざる。--bins を増やして差が消えるかを見る。
-        top = [t[1] for t in v if qbin_of(b, t[0]) == Q - 1]
-        rest = [t[1] for t in v if qbin_of(b, t[0]) < Q - 1]
+        top = [rows[i][1] for i in rows_by_bucket[b] if qbin_row[i] == Q - 1]
+        rest = [rows[i][1] for i in rows_by_bucket[b] if qbin_row[i] < Q - 1]
         mo = (f"  odds top/rest={sum(top)/len(top):.2f}/{sum(rest)/len(rest):.2f}"
               if top and rest else "")
         print(f"{lo_edge:7.1f}-{hi_edge:7.1f} {len(v):>8,}{cells}{mo}")
@@ -173,7 +181,9 @@ def main() -> int:
     h_lo, h_hi = float(hs[int(0.025 * args.iters)]), float(hs[int(0.975 * args.iters)])
     p_h_le1 = float((hs <= 1.0).mean())
 
-    print(f"\nプール: ROI(最上位q{Q})={rh:.3f}  ROI(それ以外)={rl:.3f}")
+    n_top = int(sh.sum() // 100); n_rest = int(sl.sum() // 100)
+    print(f"\nプール: ROI(最上位q{Q})={rh:.3f} (n={n_top:,})  ROI(それ以外)={rl:.3f} (n={n_rest:,})"
+          f"   上位比率={n_top / max(n_top + n_rest, 1):.3f} (期待 {1 / Q:.3f})")
     print(f"  差 = {d:+.3f}   95%CI [{lo_ci:+.3f}, {hi_ci:+.3f}]   P(差<=0) = {p_le0:.3f}")
     print(f"  最上位q{Q}の水準: ROI={rh:.3f}  95%CI [{h_lo:.3f}, {h_hi:.3f}]  "
           f"P(ROI<=1.0)={p_h_le1:.3f}")
