@@ -24,8 +24,12 @@ ER_GRID="${ER_GRID:-1.0,1.1,1.2,1.3,1.5,1.7,2.0}"
 PROB_GRID="${PROB_GRID:-0.00,0.05,0.10,0.20,0.30}"
 END_DATE_LAST="${END_DATE_LAST:-20260827}"
 
-if [ -z "${HRO_ABLATE_SED:-}" ]; then
+# 使うモデルのスキーマと env を揃えること。本番11フラグで学習した窓(~/wf_feat 等)は
+# source ~/prod_env.sh、アブレーション無しで学習した窓(~/wf_noabl 等)は HRO_ABLATE_* を
+# 全て外して ALLOW_NO_ABLATION=1。ずれると ModelBundle.assert_compatible で落ちる。
+if [ -z "${HRO_ABLATE_SED:-}" ] && [ "${ALLOW_NO_ABLATION:-}" != "1" ]; then
   echo "!! ablation env が未設定です。'source ~/prod_env.sh' を先に実行してください。" >&2
+  echo "   アブレーション無しで学習した窓なら ALLOW_NO_ABLATION=1 を付けてください。" >&2
   exit 1
 fi
 
