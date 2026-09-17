@@ -48,7 +48,9 @@ def main() -> int:
     ap.add_argument("--prob-bins", type=int, default=2,
                     help="各オッズ帯の中で確率を何分位に切るか(既定2=中央値二分)。"
                          "上げると上位分位に絞った時にROIが1.0を越えるかが見える")
-    ap.add_argument("--min-prob", type=float, default=0.0, help="事前フィルタ(運用帯に絞りたいとき)")
+    ap.add_argument("--min-prob", type=float, default=None,
+                    help="事前フィルタ(運用帯に絞りたいとき)。既定=無し。★score 列が負になり得る"
+                         "(late_flow_csv のフロースコア等)場合に 0.0 を既定にすると負側が全部落ちる")
     ap.add_argument("--score", choices=("model", "market"), default="model",
                     help="market: 確率を 1/odds に置き換える negative control。帯内の順位付けが"
                          "純粋な人気-穴バイアスだけでどれだけの差を生むかを測る(外部レビュー P0)")
@@ -58,7 +60,8 @@ def main() -> int:
     args = ap.parse_args()
 
     rows = [t for t in load(args.path, args.bet_type)
-            if t[0] >= args.min_prob and (args.max_odds is None or t[1] <= args.max_odds)]
+            if (args.min_prob is None or t[0] >= args.min_prob)
+            and (args.max_odds is None or t[1] <= args.max_odds)]
     if args.score == "market":
         # モデル確率を捨て、市場だけの順位付け(1/odds)にする。帯の中でこれが正の差を出すなら、
         # その分は「同一帯内でも人気馬ほどROIが高い」バイアスであり、モデル情報ではない。
@@ -114,7 +117,7 @@ def main() -> int:
     races = list(by_race.values())
 
     print(f"{args.bet_type}: bets={len(rows)} races={len(races)} bins={args.bins}"
-          f"{'' if args.min_prob == 0 else f' (prob>={args.min_prob} で事前フィルタ)'}")
+          f"{'' if args.min_prob is None else f' (prob>={args.min_prob} で事前フィルタ)'}")
     hdr = "".join(f"{f'q{q + 1}':>12}" for q in range(Q))
     print(f"\n各オッズ帯の中を確率で{Q}分位(q1=低prob … q{Q}=高prob)。セル='ROI(n)'")
     print(f"{'odds帯':>16} {'n':>8}{hdr}")
