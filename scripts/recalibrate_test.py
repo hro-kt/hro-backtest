@@ -114,8 +114,15 @@ class Recal:
         return float(np.interp(p, m[0], m[1]))
 
 
-def race_agg(rows, prob_fn, min_prob, top_n=None):
-    scored = [(prob_fn(p, o), pay, rid) for p, o, _h, pay, rid in rows]
+def race_agg(rows, prob_fn, min_prob, top_n=None, by_ev=False):
+    """by_ev=True なら p×odds(期待値)の大きい順に top_n を採る(Benter の決定則)。
+
+    市場寄りの p*(市場重み0.745)を p* の大きい順で買うのは市場人気順に買うのとほぼ同じで、
+    ROI は市場水準に落ちる(実測 −0.027)。Benter は p*×オッズ で選ぶ: 帯内は p_fund の順位、
+    帯間は b の効きに従い、直交成分で選ぶ形になる。
+    """
+    scored = [((prob_fn(p, o) * o) if by_ev else prob_fn(p, o), pay, rid)
+              for p, o, _h, pay, rid in rows]
     if top_n is not None:
         scored.sort(key=lambda t: -t[0])
         sel = scored[:top_n]
@@ -173,6 +180,14 @@ def main() -> int:
         ra, rb, d, lo, hi, p = paired(aggR, aggX)
         print(f"  {name:<8} n={nX:,}  ROI 生={ra:.4f} → {rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={p:.3f}")
 
+    print(f"\n[同一本数 top-{nR:,}  EV=p×odds の大きい順(Benter の決定則)]")
+    aggE0, _ = race_agg(ev_rows, raw, args.min_prob, top_n=nR, by_ev=True)
+    ra, rb, d, lo, hi, pp = paired(aggR, aggE0)
+    print(f"  {'生 p_fund':<8} ROI 確率順={ra:.4f} → EV順={rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={pp:.3f}")
+    for name, fn in (("Benter", ben), ("オッズ帯再較正", rec_b)):
+        aggX, _ = race_agg(ev_rows, fn, args.min_prob, top_n=nR, by_ev=True)
+        ra, rb, d, lo, hi, pp = paired(aggR, aggX)
+        print(f"  {name:<8} ROI 生確率順={ra:.4f} → EV順={rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={pp:.3f}")
     print(f"\n[同一本数 top-{nR:,}(較正後の確率順)]  ←閾値通過数の変化ではなく順位付けの変化だけを見る")
     for name, fn in (("全体再較正", rec_g), ("オッズ帯再較正", rec_b), ("Benter", ben)):
         aggX, _ = race_agg(ev_rows, fn, args.min_prob, top_n=nR)
