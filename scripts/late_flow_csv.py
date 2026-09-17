@@ -50,7 +50,7 @@ SELECT s.year, s.month_day, s.jyo_cd, s.kaiji, s.nichiji, s.race_num, s.umaban,
        (SELECT h.pay FROM nl_hr h
          WHERE (h.year,h.month_day,h.jyo_cd,h.kaiji,h.nichiji,h.race_num)
              = (s.year,s.month_day,s.jyo_cd,s.kaiji,s.nichiji,s.race_num)
-           AND h.kind = 'fuku' AND regexp_replace(h.kumi,'[^0-9]','','g') = s.umaban
+           AND h.bet_type = 'fuku' AND regexp_replace(h.kumi,'[^0-9]','','g') = s.umaban
          LIMIT 1) AS pay
 FROM snap s
 JOIN nl_o1 o USING (year, month_day, jyo_cd, kaiji, nichiji, race_num, umaban)
