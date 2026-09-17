@@ -4,6 +4,8 @@ ts_o1(公式時系列オッズ 0B41)から、発走 −lead 分時点のスナ�
 直前の資金流入スコアを作って **候補CSV と同じ形式** で書き出す。あとは既存の検定にそのまま流す:
 
     python scripts/late_flow_csv.py --from 20250901 --to 20260830 --lead-min 5 --out ~/lateflow.csv
+    # 11年版(現象の再現性検証。終点が確定オッズなので運用不可)
+    python scripts/late_flow_csv.py --source tyb --from 20150101 --to 20260830 --out ~/lateflow_tyb.csv
     python scripts/market_beat_test.py ~/lateflow.csv --bet-type place --prob-bins 5 --bins 100
       → 最終オッズ帯を固定し、score(直前フロー)の上位/下位で ROI が分かれるか。
         対照: --score market。差>0 なら「価格経路は最終価格に無い情報を持つ」が我々の土俵で再現。
@@ -23,6 +25,29 @@ from collections import defaultdict
 
 from hro_features.config import load_config as load_features_config
 from hro_features.db import FeatureDB
+
+SQL_TYB = """
+-- JRDB TYB の直前単勝オッズ → 確定単勝オッズ のプール占有率変化。2015年から11年分ある。
+-- ★終点が確定オッズなので**運用には使えない**(決定時点で見えない)。
+--   目的は「締切間際の資金流入が予測力を持つ」という現象の再現性を11年で確かめること。
+--   運用形(ts_o1 で T−6m→T−60s、締切前で完結)は1年しか無く窓を増やせないため、これで補う。
+-- 占有率は単勝の 1/odds(プール占有率そのもの)。複勝下限は他馬の組合せに依存し粗いので使わない。
+SELECT t.year||t.month_day||t.jyo_cd||o.kaiji||o.nichiji||t.race_num AS rid, t.umaban,
+       t.tan_odds AS tan0,
+       o.tan_odds::numeric/10.0 AS tan1,
+       o.fuku_odds_low::numeric/10.0 AS final_odds,
+       (SELECT h.pay FROM nl_hr h
+         WHERE (h.year,h.month_day,h.jyo_cd,h.kaiji,h.nichiji,h.race_num)
+             = (o.year,o.month_day,o.jyo_cd,o.kaiji,o.nichiji,o.race_num)
+           AND h.bet_type='fuku' AND regexp_replace(h.kumi,'[^0-9]','','g') = t.umaban LIMIT 1) AS pay
+FROM nl_jrdb_tyb t
+JOIN nl_o1 o ON (o.year,o.month_day,o.jyo_cd,o.race_num,o.umaban)
+              = (t.year,t.month_day,t.jyo_cd,t.race_num,t.umaban)
+WHERE t.year||t.month_day BETWEEN %(d0)s AND %(d1)s
+  AND t.tan_odds IS NOT NULL AND t.tan_odds > 0
+  AND o.tan_odds ~ '^[0-9]+$' AND o.tan_odds::numeric > 0
+  AND o.fuku_odds_low ~ '^[0-9]+$' AND o.fuku_odds_low::numeric > 0
+"""
 
 SQL = """
 WITH ra AS (
@@ -64,12 +89,24 @@ def main() -> int:
     ap.add_argument("--from", dest="d0", required=True)
     ap.add_argument("--to", dest="d1", required=True)
     ap.add_argument("--lead-min", type=int, default=5, help="発走の何分前のスナップショットと比べるか")
+    ap.add_argument("--source", choices=("ts", "tyb"), default="ts",
+                    help="ts: ts_o1 の T−lead分(締切前で完結・運用形) / "
+                         "tyb: JRDB TYB 直前→確定(11年・現象の再現性検証用、運用不可)")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
     db = FeatureDB(load_features_config())
     try:
-        rows = db.query(SQL, {"d0": args.d0, "d1": args.d1, "lead": args.lead_min})
+        if args.source == "tyb":
+            rows = db.query(SQL_TYB, {"d0": args.d0, "d1": args.d1})
+            for r in rows:   # 共通形に合わせる(占有率は単勝、odds 列は確定複勝下限)
+                r["snap_odds"], r["q_end"] = float(r["tan0"]), float(r["tan1"])
+        else:
+            rows = db.query(SQL, {"d0": args.d0, "d1": args.d1, "lead": args.lead_min})
+            for r in rows:
+                r["rid"] = "".join((r["year"], r["month_day"], r["jyo_cd"],
+                                    r["kaiji"], r["nichiji"], r["race_num"]))
+                r["q_end"] = float(r["final_odds"])
     finally:
         db.close()
     if not rows:
@@ -79,15 +116,14 @@ def main() -> int:
     # レース内シェア(1/odds 正規化)を両時点で
     by_race = defaultdict(list)
     for r in rows:
-        by_race[(r["year"], r["month_day"], r["jyo_cd"], r["kaiji"], r["nichiji"], r["race_num"])].append(r)
+        by_race[r["rid"]].append(r)
     out, n_hit = [], 0
-    for key, rs in by_race.items():
+    for rid, rs in by_race.items():
         s_snap = sum(1.0 / float(r["snap_odds"]) for r in rs)
-        s_fin = sum(1.0 / float(r["final_odds"]) for r in rs)
-        rid = "".join(key)
+        s_fin = sum(1.0 / float(r["q_end"]) for r in rs)
         for r in rs:
             sh0 = (1.0 / float(r["snap_odds"])) / s_snap
-            sh1 = (1.0 / float(r["final_odds"])) / s_fin
+            sh1 = (1.0 / float(r["q_end"])) / s_fin
             lg = lambda x: math.log(min(max(x, 1e-6), 1 - 1e-6) / (1 - min(max(x, 1e-6), 1 - 1e-6)))
             score = lg(sh1) - lg(sh0)
             pay = r["pay"]
