@@ -122,6 +122,11 @@ def main() -> int:
     ap.add_argument("--lead-sec", type=int, default=30, help="決定時点 = 発走 −これ秒")
     ap.add_argument("--flow-min", type=int, default=5, help="フローの起点 = 発走 −これ分")
     ap.add_argument("--top-frac", type=float, default=0.10, help="eval 内で買う割合(同一本数比較)")
+    ap.add_argument("--rolling", action="store_true",
+                    help="月単位の拡大窓ローリング。各 eval 月について『その月より前の全データ』で fit し、"
+                         "月ごとに top-frac を買って全月をプール。eval を 4ヶ月→8ヶ月に増やし月別の再現も見る"
+                         "(ts_o1 は1年しか無く、単一分割の eval 1,371本では CI が ±0.2 で判定不能だった)")
+    ap.add_argument("--min-fit-months", type=int, default=4, help="ローリングの最小 fit 月数")
     args = ap.parse_args()
 
     pf = load_cand(args.cand)
@@ -148,10 +153,6 @@ def main() -> int:
                                      "flow": lg(share1) - lg(share0), "pf": p_fund}))
     print(f"ts_o1 結合 {len(rows):,} 行 → p_fund あり {len(items):,} (欠落 {miss:,})   "
           f"決定時点 T−{args.lead_sec}s, フロー起点 T−{args.flow_min}m")
-    fit = [it for it in items if it[2]["ymd"] <= args.fit_to]
-    ev = [it for it in items if it[2]["ymd"] >= args.eval_from]
-    print(f"fit {len(fit):,} 本 / eval {len(ev):,} 本 ({len({i[0] for i in ev}):,} レース)")
-
     def design(its, with_flow):
         cols = [np.ones(len(its)),
                 np.array([lg(i[2]["qimp"]) for i in its]),
@@ -159,27 +160,91 @@ def main() -> int:
         if with_flow:
             cols.append(np.array([i[2]["flow"] for i in its]))
         return np.column_stack(cols)
-    y = np.array([1.0 if i[1] > 0 else 0.0 for i in fit])
-    wB = irls(design(fit, False), y); wF = irls(design(fit, True), y)
-    print(f"  Benter(snap) : logit p* = {wB[0]:+.3f} + {wB[1]:.3f}·logit(q_snap) + {wB[2]:.3f}·logit(p_fund)")
-    print(f"  +flow        : logit p* = {wF[0]:+.3f} + {wF[1]:.3f}·logit(q_snap) + {wF[2]:.3f}·logit(p_fund) + {wF[3]:+.3f}·flow")
-
     def pstar(w, it, with_flow):
         z = w[0] + w[1] * lg(it[2]["qimp"]) + w[2] * lg(it[2]["pf"]) + (w[3] * it[2]["flow"] if with_flow else 0)
         return 1 / (1 + math.exp(-z))
-    n = max(1, int(len(ev) * args.top_frac))
-    base = agg_topn(ev, lambda it: it[2]["pf"], n)
-    variants = [
-        ("生p_fund EV順(q_snap)", lambda it: it[2]["pf"] * it[2]["q1"]),
-        ("Benter(snap) EV順",     lambda it: pstar(wB, it, False) * it[2]["q1"]),
-        ("Benter+flow EV順",      lambda it: pstar(wF, it, True) * it[2]["q1"]),
-        ("flow 単独(順位)",        lambda it: it[2]["flow"]),
-    ]
-    print(f"\n[eval 同一本数 top-{n:,}  基準=生 p_fund 確率順]  EV は q_snap(決定時点のオッズ)で計算、払戻は実際")
-    for name, sc in variants:
-        aggX = agg_topn(ev, sc, n)
-        ra, rb, d, lo, hi, pp = paired(base, aggX)
-        print(f"  {name:<22} ROI {ra:.4f} → {rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={pp:.3f}")
+
+    def fit_weights(fit_items):
+        y = np.array([1.0 if i[1] > 0 else 0.0 for i in fit_items])
+        return irls(design(fit_items, False), y), irls(design(fit_items, True), y)
+
+    def variants_for(wB, wF):
+        return [
+            ("生p_fund EV順(q_snap)", lambda it: it[2]["pf"] * it[2]["q1"]),
+            ("Benter(snap) EV順",     lambda it: pstar(wB, it, False) * it[2]["q1"]),
+            ("Benter+flow EV順",      lambda it: pstar(wF, it, True) * it[2]["q1"]),
+            ("flow 単独(順位)",        lambda it: it[2]["flow"]),
+        ]
+    NAMES = [v[0] for v in variants_for(np.zeros(3), np.zeros(4))]
+
+    def report(base_agg, agg_by_name, sel_by_name, label):
+        print(f"\n[{label}]  EV は q_snap(決定時点のオッズ)で計算、払戻は実績")
+        rb0 = sum(v[1] for v in base_agg.values()) / sum(v[0] for v in base_agg.values())
+        nb = int(sum(v[0] for v in base_agg.values()) // 100)
+        print(f"  {'基準 生p_fund確率順':<22} ROI {rb0:.4f}  n={nb:,}")
+        for nm in NAMES:
+            ra, rb, d, lo, hi, pp = paired(base_agg, agg_by_name[nm])
+            sel = sel_by_name[nm]
+            hit = sum(1 for _r, pay, _f in sel if pay > 0) / max(len(sel), 1)
+            mo = sum(f["q1"] for _r, _p, f in sel) / max(len(sel), 1)
+            print(f"  {nm:<22} ROI {rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={pp:.3f}"
+                  f"   的中={hit:.1%} 平均odds={mo:.2f}")
+
+    if not args.rolling:
+        fit = [it for it in items if it[2]["ymd"] <= args.fit_to]
+        ev = [it for it in items if it[2]["ymd"] >= args.eval_from]
+        print(f"fit {len(fit):,} 本 / eval {len(ev):,} 本 ({len({i[0] for i in ev}):,} レース)")
+        wB, wF = fit_weights(fit)
+        print(f"  Benter(snap) : logit p* = {wB[0]:+.3f} + {wB[1]:.3f}·logit(q_snap) + {wB[2]:.3f}·logit(p_fund)")
+        print(f"  +flow        : logit p* = {wF[0]:+.3f} + {wF[1]:.3f}·logit(q_snap) + {wF[2]:.3f}·logit(p_fund) + {wF[3]:+.3f}·flow")
+        n = max(1, int(len(ev) * args.top_frac))
+        base = agg_topn(ev, lambda it: it[2]["pf"], n)
+        agg_by, sel_by = {}, {}
+        for nm, sc in variants_for(wB, wF):
+            agg_by[nm] = agg_topn(ev, sc, n)
+            sel_by[nm] = sorted(ev, key=lambda it: -sc(it))[:n]
+        report(base, agg_by, sel_by, f"eval 同一本数 top-{n:,}  基準=生 p_fund 確率順")
+        return 0
+
+    # ---- 拡大窓ローリング(月単位) ----
+    months = sorted({it[2]["ymd"][:6] for it in items})
+    print(f"ローリング: 月 {months[0]}〜{months[-1]} ({len(months)}ヶ月), 最小fit {args.min_fit_months}ヶ月")
+    base_all = defaultdict(lambda: [0.0, 0.0])
+    agg_all = {nm: defaultdict(lambda: [0.0, 0.0]) for nm in NAMES}
+    sel_all = {nm: [] for nm in NAMES}
+    per_month = []
+    for i, m in enumerate(months):
+        if i < args.min_fit_months:
+            continue
+        fit = [it for it in items if it[2]["ymd"][:6] < m]
+        ev = [it for it in items if it[2]["ymd"][:6] == m]
+        if len(ev) < 200:
+            continue
+        wB, wF = fit_weights(fit)
+        n = max(1, int(len(ev) * args.top_frac))
+        b = agg_topn(ev, lambda it: it[2]["pf"], n)
+        for rid, (st, pa) in b.items():
+            base_all[rid][0] += st; base_all[rid][1] += pa
+        row = {"m": m, "n": n, "fit": len(fit), "wB1": wB[1], "wF3": wF[3]}
+        for nm, sc in variants_for(wB, wF):
+            a = agg_topn(ev, sc, n)
+            for rid, (st, pa) in a.items():
+                agg_all[nm][rid][0] += st; agg_all[nm][rid][1] += pa
+            sel_all[nm] += sorted(ev, key=lambda it: -sc(it))[:n]
+            row[nm] = sum(v[1] for v in a.values()) / sum(v[0] for v in a.values())
+        row["base"] = sum(v[1] for v in b.values()) / sum(v[0] for v in b.values())
+        per_month.append(row)
+
+    print(f"\n[月別 ROI]  {'月':<8}{'n':>6}{'基準':>8}" + "".join(f"{nm[:10]:>12}" for nm in NAMES)
+          + f"{'市場重み':>9}{'flow係数':>9}")
+    for r in per_month:
+        print(f"  {r['m']:<8}{r['n']:>6,}{r['base']:>8.3f}" + "".join(f"{r[nm]:>12.3f}" for nm in NAMES)
+              + f"{r['wB1']:>9.3f}{r['wF3']:>9.3f}")
+    base_all = {k: tuple(v) for k, v in base_all.items()}
+    agg_all = {nm: {k: tuple(v) for k, v in d.items()} for nm, d in agg_all.items()}
+    report(base_all, agg_all, sel_all, f"全 {len(per_month)} ヶ月をプール")
+    wins = {nm: sum(1 for r in per_month if r[nm] > r["base"]) for nm in NAMES}
+    print("\n  月別で基準を上回った回数: " + "  ".join(f"{nm[:12]}={wins[nm]}/{len(per_month)}" for nm in NAMES))
     return 0
 
 
