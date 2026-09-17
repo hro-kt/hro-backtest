@@ -155,6 +155,10 @@ def main() -> int:
     ap.add_argument("--eval", nargs="+", required=True)
     ap.add_argument("--bet-type", default="place")
     ap.add_argument("--min-prob", type=float, default=0.40)
+    ap.add_argument("--top-n", type=int, default=None,
+                    help="同一本数比較の n を明示(既定: 生 prob>=min-prob の通過数)。頑健性確認で 2000/5000/10000 等")
+    ap.add_argument("--by-file", action="store_true",
+                    help="eval をファイル(=窓)ごとにも分けて Benter EV順 vs 生確率順 を出す(年ごとの再現確認)")
     args = ap.parse_args()
 
     fit_rows, ev_rows = load(args.fit, args.bet_type), load(args.eval, args.bet_type)
@@ -174,7 +178,12 @@ def main() -> int:
                   f"  的中率={np.mean([s[1] for s in sel]):.3f}")
 
     aggR, nR = race_agg(ev_rows, raw, args.min_prob)
-    print(f"\n[閾値 prob>={args.min_prob}]  生: n={nR:,}")
+    if args.top_n:
+        nR = args.top_n
+        aggR, _ = race_agg(ev_rows, raw, args.min_prob, top_n=nR)   # 生も同一本数の確率順に揃える
+        print(f"\n[基準: 生 p_fund 確率順 top-{nR:,}]")
+    else:
+        print(f"\n[閾値 prob>={args.min_prob}]  生: n={nR:,}")
     for name, fn in (("全体再較正", rec_g), ("オッズ帯再較正", rec_b), ("Benter", ben)):
         aggX, nX = race_agg(ev_rows, fn, args.min_prob)
         ra, rb, d, lo, hi, p = paired(aggR, aggX)
@@ -193,6 +202,17 @@ def main() -> int:
         aggX, _ = race_agg(ev_rows, fn, args.min_prob, top_n=nR)
         ra, rb, d, lo, hi, p = paired(aggR, aggX)
         print(f"  {name:<8} ROI 生={ra:.4f} → {rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={p:.3f}")
+    if args.by_file:
+        print("\n[eval ファイル別: Benter EV順 vs 生確率順(各ファイル内で同一本数)]")
+        for path in args.eval:
+            sub = load([path], args.bet_type)
+            aR, n_sub = race_agg(sub, raw, args.min_prob)
+            if args.top_n:
+                n_sub = max(1, int(round(args.top_n * len(sub) / max(len(ev_rows), 1))))
+                aR, _ = race_agg(sub, raw, args.min_prob, top_n=n_sub)
+            aB, _ = race_agg(sub, ben, args.min_prob, top_n=n_sub, by_ev=True)
+            ra, rb, d, lo, hi, pp = paired(aR, aB, iters=4000)
+            print(f"  {path.split('/')[-2]:<6} n={n_sub:>6,}  生={ra:.4f} → Benter EV={rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={pp:.3f}")
     return 0
 
 
