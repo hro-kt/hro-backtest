@@ -36,7 +36,9 @@ WITH ra AS (
 ),
 s1 AS (  -- 決定時点: 発走 −lead 秒 以前の最新
   SELECT DISTINCT ON (t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban)
-         t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban, t.fuku_odds_low AS f1
+         t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban, t.fuku_odds_low AS f1,
+         t.tan_odds AS t1,
+         EXTRACT(EPOCH FROM (ra.post_ts - to_timestamp(t.year||t.hasso_time,'YYYYMMDDHH24MI'))) AS lead1
   FROM ts_o1 t JOIN ra USING (year,month_day,jyo_cd,kaiji,nichiji,race_num)
   WHERE to_timestamp(t.year||t.hasso_time,'YYYYMMDDHH24MI') <= ra.post_ts - make_interval(secs => %(lead)s)
     AND t.fuku_odds_low ~ '^[0-9]+$' AND t.fuku_odds_low::numeric > 0
@@ -44,7 +46,9 @@ s1 AS (  -- 決定時点: 発走 −lead 秒 以前の最新
 ),
 s0 AS (  -- フローの起点: 発走 −flow 分 以前の最新
   SELECT DISTINCT ON (t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban)
-         t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban, t.fuku_odds_low AS f0
+         t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban, t.fuku_odds_low AS f0,
+         t.tan_odds AS t0,
+         EXTRACT(EPOCH FROM (ra.post_ts - to_timestamp(t.year||t.hasso_time,'YYYYMMDDHH24MI'))) AS lead0
   FROM ts_o1 t JOIN ra USING (year,month_day,jyo_cd,kaiji,nichiji,race_num)
   WHERE to_timestamp(t.year||t.hasso_time,'YYYYMMDDHH24MI') <= ra.post_ts - make_interval(mins => %(flow)s)
     AND t.fuku_odds_low ~ '^[0-9]+$' AND t.fuku_odds_low::numeric > 0
@@ -52,6 +56,9 @@ s0 AS (  -- フローの起点: 発走 −flow 分 以前の最新
 )
 SELECT s1.year||s1.month_day||s1.jyo_cd||s1.kaiji||s1.nichiji||s1.race_num AS rid, s1.umaban,
        s1.f1::numeric/10.0 AS q1, s0.f0::numeric/10.0 AS q0,
+       s1.lead1, s0.lead0,
+       CASE WHEN s1.t1 ~ '^[0-9]+$' AND s1.t1::numeric>0 THEN s1.t1::numeric/10.0 END AS tan1,
+       CASE WHEN s0.t0 ~ '^[0-9]+$' AND s0.t0::numeric>0 THEN s0.t0::numeric/10.0 END AS tan0,
        (SELECT h.pay FROM nl_hr h
          WHERE (h.year,h.month_day,h.jyo_cd,h.kaiji,h.nichiji,h.race_num)
              = (s1.year,s1.month_day,s1.jyo_cd,s1.kaiji,s1.nichiji,s1.race_num)
@@ -89,6 +96,19 @@ def irls(X, y, l2=1e-6):
         if np.abs(step).max() < 1e-8:
             break
     return w
+
+
+def level(agg, iters=10000, seed=7):
+    """プールした ROI 自体の CI と P(ROI<=1.0)。基準との差だけでは「勝てるか」を答えられない。"""
+    rids = sorted(agg)
+    st = np.array([agg[r][0] for r in rids]); pa = np.array([agg[r][1] for r in rids])
+    rng = np.random.default_rng(seed); k = len(rids); out = np.empty(iters); done = 0
+    while done < iters:
+        m = min(200, iters - done); idx = rng.integers(0, k, size=(m, k))
+        out[done:done + m] = pa[idx].sum(1) / st[idx].sum(1); done += m
+    d = np.sort(out)
+    return (pa.sum() / st.sum(), float(d[int(.025 * iters)]), float(d[int(.975 * iters)]),
+            float((d <= 1.0).mean()))
 
 
 def paired(aggA, aggB, iters=10000, seed=42):
@@ -141,18 +161,38 @@ def main() -> int:
     by_race = defaultdict(list)
     for r in rows:
         by_race[r["rid"]].append(r)
+    # ★リーク監査: 採用したスナップショットが本当に締切前か。ts_o1 の発表時刻は発走をまたぐ
+    #   ものもあるので、post_ts − snap_ts が 0 以下なら締切後の値を拾っている＝結果リーク。
+    l1 = sorted(float(r["lead1"]) for r in rows); l0 = sorted(float(r["lead0"]) for r in rows)
+    def q(a, f): return a[min(len(a) - 1, int(len(a) * f))]
+    bad = sum(1 for v in l1 if v <= 0)
+    print(f"リード時間監査(post − snap 秒): 決定時点 中央値 {q(l1,.5):,.0f}s "
+          f"[p05 {q(l1,.05):,.0f} / p95 {q(l1,.95):,.0f}]   起点 中央値 {q(l0,.5):,.0f}s")
+    print(f"  締切後(<=0s)を拾った行: {bad:,} / {len(rows):,}"
+          + ("  ★リーク。SQL の条件を見直すこと" if bad else "  (0件=締切前のみ)"))
+
     items = []   # (rid, pay, dict)
     miss = 0
     for rid, rs in by_race.items():
         s1 = sum(1 / float(r["q1"]) for r in rs); s0 = sum(1 / float(r["q0"]) for r in rs)
+        # 単勝プール: 1/tan_odds はプール占有率そのもの(複勝下限は他馬の組合せに依存し粗い)
+        ts1 = sum(1 / float(r["tan1"]) for r in rs if r["tan1"])
+        ts0 = sum(1 / float(r["tan0"]) for r in rs if r["tan0"])
         for r in rs:
             p_fund = pf.get((rid, f"{int(r['umaban']):02d}"))
             if p_fund is None:
                 miss += 1; continue
             q1 = float(r["q1"]); share1 = (1 / q1) / s1; share0 = (1 / float(r["q0"])) / s0
+            flow_p = lg(share1) - lg(share0)
+            if r["tan1"] and r["tan0"] and ts1 > 0 and ts0 > 0:
+                flow_t = lg((1 / float(r["tan1"])) / ts1) - lg((1 / float(r["tan0"])) / ts0)
+            else:
+                flow_t = 0.0
             pay = int(str(r["pay"]).strip()) if r["pay"] is not None and str(r["pay"]).strip().isdigit() else 0
             items.append((rid, pay, {"ymd": rid[:8], "q1": q1, "qimp": min(0.8 / q1, 0.98),
-                                     "flow": lg(share1) - lg(share0), "pf": p_fund}))
+                                     "flow": flow_p, "flow_tan": flow_t,
+                                     "xpool": flow_t - flow_p,   # 単勝が先行し複勝が未反応=正
+                                     "pf": p_fund}))
     print(f"ts_o1 結合 {len(rows):,} 行 → p_fund あり {len(items):,} (欠落 {miss:,})   "
           f"決定時点 T−{args.lead_sec}s, フロー起点 T−{args.flow_min}m")
     def design(its, with_flow):
@@ -176,6 +216,8 @@ def main() -> int:
             ("Benter(snap) EV順",     lambda it: pstar(wB, it, False) * it[2]["q1"]),
             ("Benter+flow EV順",      lambda it: pstar(wF, it, True) * it[2]["q1"]),
             ("flow 単独(順位)",        lambda it: it[2]["flow"]),
+            ("flow_tan 単独(単勝プール)", lambda it: it[2]["flow_tan"]),
+            ("xpool(単勝先行-複勝未反応)", lambda it: it[2]["xpool"]),
         ]
     NAMES = [v[0] for v in variants_for(np.zeros(3), np.zeros(4))]
 
@@ -189,8 +231,10 @@ def main() -> int:
             sel = sel_by_name[nm]
             hit = sum(1 for _r, pay, _f in sel if pay > 0) / max(len(sel), 1)
             mo = sum(f["q1"] for _r, _p, f in sel) / max(len(sel), 1)
-            print(f"  {nm:<22} ROI {rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={pp:.3f}"
-                  f"   的中={hit:.1%} 平均odds={mo:.2f}")
+            lv, llo, lhi, p1 = level(agg_by_name[nm])
+            print(f"  {nm:<22} ROI {rb:.4f} [{llo:.3f},{lhi:.3f}] P(ROI<=1)={p1:.3f}"
+                  f"  差={d:+.4f} [{lo:+.4f},{hi:+.4f}] P(差<=0)={pp:.3f}"
+                  f"  的中={hit:.1%} odds={mo:.2f}")
 
     if not args.rolling:
         fit = [it for it in items if it[2]["ymd"] <= args.fit_to]
