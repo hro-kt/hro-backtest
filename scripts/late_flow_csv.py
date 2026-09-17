@@ -89,6 +89,10 @@ def main() -> int:
     ap.add_argument("--from", dest="d0", required=True)
     ap.add_argument("--to", dest="d1", required=True)
     ap.add_argument("--lead-min", type=int, default=5, help="発走の何分前のスナップショットと比べるか")
+    ap.add_argument("--score-mode", choices=("flow", "level_end", "level_start"), default="flow",
+                    help="flow: 占有率の変化(late money 仮説) / level_end: 終点の占有率の水準 / "
+                         "level_start: 起点の水準。★帯分けは確定複勝オッズなので、水準でも同じ差が出るなら"
+                         "現象は『変化』ではなく単勝/複勝のプール間乖離(cross-pool)。運用設計(1時点 vs 2時点)が変わる")
     ap.add_argument("--source", choices=("ts", "tyb"), default="ts",
                     help="ts: ts_o1 の T−lead分(締切前で完結・運用形) / "
                          "tyb: JRDB TYB 直前→確定(11年・現象の再現性検証用、運用不可)")
@@ -125,7 +129,7 @@ def main() -> int:
             sh0 = (1.0 / float(r["snap_odds"])) / s_snap
             sh1 = (1.0 / float(r["q_end"])) / s_fin
             lg = lambda x: math.log(min(max(x, 1e-6), 1 - 1e-6) / (1 - min(max(x, 1e-6), 1 - 1e-6)))
-            score = lg(sh1) - lg(sh0)
+            score = ({"flow": lg(sh1) - lg(sh0), "level_end": lg(sh1), "level_start": lg(sh0)})[args.score_mode]
             pay = r["pay"]
             pay_i = int(str(pay).strip() or 0) if pay is not None and str(pay).strip().isdigit() else 0
             hit = pay_i > 0
@@ -138,7 +142,9 @@ def main() -> int:
                     "seg_runs", "seg_layoff", "race_id", "selection_id"])
         w.writerows(out)
     print(f"{len(out):,} 行 / {len(by_race):,} レース / 的中 {n_hit:,} → {args.out}")
-    print("  prob 列 = 直前フロースコア(logit share 最終 − T−lead)。odds 列 = 確定複勝下限。")
+    print(f"  prob 列 = {args.score_mode}"
+          f"{'(logit share 終点 − 起点)' if args.score_mode=='flow' else '(logit share の水準)'}"
+          "。odds 列 = 確定複勝下限。")
     return 0
 
 
