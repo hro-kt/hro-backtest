@@ -189,9 +189,15 @@ def main() -> int:
             else:
                 flow_t = 0.0
             pay = int(str(r["pay"]).strip()) if r["pay"] is not None and str(r["pay"]).strip().isdigit() else 0
+            # ★決定時点(T−60s)での単勝/複勝プール乖離の**水準**。11年検証で現象の主成分は
+            #   「変化」ではなく「確定時点の単勝占有率の水準」(level_end +0.109 vs level_start +0.014)
+            #   = Hausch–Ziemba の place/show 非効率。確定オッズは決定時点に見えないが、
+            #   同じ乖離を T−60s で測れば使える(単勝・複勝とも見えている)。1時点で済むので運用が単純。
+            xlv = (lg((1 / float(r["tan1"])) / ts1) - lg(share1)) if (r["tan1"] and ts1 > 0) else 0.0
             items.append((rid, pay, {"ymd": rid[:8], "q1": q1, "qimp": min(0.8 / q1, 0.98),
                                      "flow": flow_p, "flow_tan": flow_t,
-                                     "xpool": flow_t - flow_p,   # 単勝が先行し複勝が未反応=正
+                                     "xpool": flow_t - flow_p,   # 変化の差(単勝が先行し複勝が未反応)
+                                     "xpool_level": xlv,         # 水準の差(決定時点の乖離そのもの)
                                      "pf": p_fund}))
     print(f"ts_o1 結合 {len(rows):,} 行 → p_fund あり {len(items):,} (欠落 {miss:,})   "
           f"決定時点 T−{args.lead_sec}s, フロー起点 T−{args.flow_min}m")
@@ -218,6 +224,8 @@ def main() -> int:
             ("flow 単独(順位)",        lambda it: it[2]["flow"]),
             ("flow_tan 単独(単勝プール)", lambda it: it[2]["flow_tan"]),
             ("xpool(単勝先行-複勝未反応)", lambda it: it[2]["xpool"]),
+            ("xpool_level(水準乖離)",   lambda it: it[2]["xpool_level"]),
+            ("xpool_level+flow_tan",   lambda it: it[2]["xpool_level"] + it[2]["flow_tan"]),
         ]
     NAMES = [v[0] for v in variants_for(np.zeros(3), np.zeros(4))]
 
