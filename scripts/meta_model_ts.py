@@ -117,8 +117,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cand", nargs="+", required=True, help="place 候補CSV(p_fund の出どころ)")
     ap.add_argument("--from", dest="d0", default="20250901"); ap.add_argument("--to", dest="d1", default="20260831")
-    ap.add_argument("--fit-to", required=True, help="YYYYMMDD。これ以前で fit")
-    ap.add_argument("--eval-from", required=True, help="YYYYMMDD。これ以降で eval")
+    ap.add_argument("--fit-to", default=None, help="YYYYMMDD。これ以前で fit(--rolling 時は不要)")
+    ap.add_argument("--eval-from", default=None, help="YYYYMMDD。これ以降で eval(--rolling 時は不要)")
     ap.add_argument("--lead-sec", type=int, default=30, help="決定時点 = 発走 −これ秒")
     ap.add_argument("--flow-min", type=int, default=5, help="フローの起点 = 発走 −これ分")
     ap.add_argument("--top-frac", type=float, default=0.10, help="eval 内で買う割合(同一本数比較)")
@@ -128,6 +128,8 @@ def main() -> int:
                          "(ts_o1 は1年しか無く、単一分割の eval 1,371本では CI が ±0.2 で判定不能だった)")
     ap.add_argument("--min-fit-months", type=int, default=4, help="ローリングの最小 fit 月数")
     args = ap.parse_args()
+    if not args.rolling and not (args.fit_to and args.eval_from):
+        ap.error("--rolling を使わない場合は --fit-to と --eval-from が要ります")
 
     pf = load_cand(args.cand)
     db = FeatureDB(load_features_config())
