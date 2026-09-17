@@ -1,0 +1,187 @@
+"""本番形の meta-model: 決定時点(T−lead秒)のスナップショットオッズ + 直前フロー + 凍結 fundamental。
+
+Benter 型(市場 baseline + 凍結 p_fund を少数パラメータで統合し EV で選ぶ)は、確定オッズ q で
+ローリング6窓中5窓が正(平均 +3.1pt)。しかし本番で T−30s に見えるのは確定オッズではない。
+ここでは q を ts_o1 の T−lead 時点の値に置き換え、直前フロー(T−flow分 → T−lead の
+レース内シェアの logit 差)を項として足し、EV = p* × q_snap で選んで、払戻は実際(nl_hr)で決済する。
+= そのまま運用に載せられる形のバックテスト(確定オッズの楽観上限ではない)。
+
+  logit(p*) = a + b·logit(q_snap) + c·logit(p_fund) + d·flow
+
+p_fund は候補CSV(sweep --save-candidates, place)の prob(市場を見せずに作ったモデルの PL 複勝確率)。
+fit/eval は日付で時系列分割。同一本数 top-n で「生 p_fund 確率順」と比較(対応のあるブートストラップ)。
+
+    python scripts/meta_model_ts.py --cand ~/wf/2025/cand.csv ~/wf/2026/cand.csv \\
+        --fit-to 20260430 --eval-from 20260501 --lead-sec 30 --flow-min 5 --top-frac 0.10
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import math
+from collections import defaultdict
+
+import numpy as np
+
+from hro_features.config import load_config as load_features_config
+from hro_features.db import FeatureDB
+
+SQL = """
+WITH ra AS (
+  SELECT year, month_day, jyo_cd, kaiji, nichiji, race_num,
+         to_timestamp(year||month_day||hasso_time, 'YYYYMMDDHH24MI') AS post_ts
+  FROM nl_ra
+  WHERE jyo_cd BETWEEN '01' AND '10' AND year||month_day BETWEEN %(d0)s AND %(d1)s
+    AND hasso_time ~ '^[0-9]{4}$'
+),
+s1 AS (  -- 決定時点: 発走 −lead 秒 以前の最新
+  SELECT DISTINCT ON (t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban)
+         t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban, t.fuku_odds_low AS f1
+  FROM ts_o1 t JOIN ra USING (year,month_day,jyo_cd,kaiji,nichiji,race_num)
+  WHERE to_timestamp(t.year||t.hasso_time,'YYYYMMDDHH24MI') <= ra.post_ts - make_interval(secs => %(lead)s)
+    AND t.fuku_odds_low ~ '^[0-9]+$' AND t.fuku_odds_low::numeric > 0
+  ORDER BY t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban, t.hasso_time DESC
+),
+s0 AS (  -- フローの起点: 発走 −flow 分 以前の最新
+  SELECT DISTINCT ON (t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban)
+         t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban, t.fuku_odds_low AS f0
+  FROM ts_o1 t JOIN ra USING (year,month_day,jyo_cd,kaiji,nichiji,race_num)
+  WHERE to_timestamp(t.year||t.hasso_time,'YYYYMMDDHH24MI') <= ra.post_ts - make_interval(mins => %(flow)s)
+    AND t.fuku_odds_low ~ '^[0-9]+$' AND t.fuku_odds_low::numeric > 0
+  ORDER BY t.year,t.month_day,t.jyo_cd,t.kaiji,t.nichiji,t.race_num,t.umaban, t.hasso_time DESC
+)
+SELECT s1.year||s1.month_day||s1.jyo_cd||s1.kaiji||s1.nichiji||s1.race_num AS rid, s1.umaban,
+       s1.f1::numeric/10.0 AS q1, s0.f0::numeric/10.0 AS q0,
+       (SELECT h.pay FROM nl_hr h
+         WHERE (h.year,h.month_day,h.jyo_cd,h.kaiji,h.nichiji,h.race_num)
+             = (s1.year,s1.month_day,s1.jyo_cd,s1.kaiji,s1.nichiji,s1.race_num)
+           AND h.bet_type='fuku' AND regexp_replace(h.kumi,'[^0-9]','','g') = s1.umaban LIMIT 1) AS pay
+FROM s1 JOIN s0 USING (year,month_day,jyo_cd,kaiji,nichiji,race_num,umaban)
+"""
+
+
+def lg(x):
+    x = min(max(float(x), 1e-6), 1 - 1e-6)
+    return math.log(x / (1 - x))
+
+
+def load_cand(paths):
+    pf = {}
+    for p in paths:
+        with open(p, encoding="utf-8") as f:
+            r = csv.reader(f); next(r, None)
+            for row in r:
+                if row[0] != "place" or row[4] != "True":
+                    continue
+                rid = row[9] if len(row) > 9 else ""
+                sel = row[10] if len(row) > 10 else ""
+                if rid and sel.strip().isdigit():
+                    pf[(rid, f"{int(sel):02d}")] = float(row[2])
+    return pf
+
+
+def irls(X, y, l2=1e-6):
+    w = np.zeros(X.shape[1])
+    for _ in range(60):
+        mu = 1 / (1 + np.exp(-(X @ w))); W = mu * (1 - mu) + 1e-9
+        g = X.T @ (y - mu); H = (X * W[:, None]).T @ X + l2 * np.eye(X.shape[1])
+        step = np.linalg.solve(H, g); w += step
+        if np.abs(step).max() < 1e-8:
+            break
+    return w
+
+
+def paired(aggA, aggB, iters=10000, seed=42):
+    rids = sorted(set(aggA) | set(aggB))
+    sa = np.array([aggA.get(r, (0, 0))[0] for r in rids]); pa = np.array([aggA.get(r, (0, 0))[1] for r in rids])
+    sb = np.array([aggB.get(r, (0, 0))[0] for r in rids]); pb = np.array([aggB.get(r, (0, 0))[1] for r in rids])
+    ra, rb = pa.sum() / sa.sum(), pb.sum() / sb.sum()
+    rng = np.random.default_rng(seed); k = len(rids); out = np.empty(iters); done = 0
+    while done < iters:
+        m = min(200, iters - done); idx = rng.integers(0, k, size=(m, k))
+        out[done:done + m] = pb[idx].sum(1) / sb[idx].sum(1) - pa[idx].sum(1) / sa[idx].sum(1); done += m
+    d = np.sort(out)
+    return ra, rb, rb - ra, float(d[int(.025 * iters)]), float(d[int(.975 * iters)]), float((d <= 0).mean())
+
+
+def agg_topn(items, score, n):
+    """items: list of (rid, pay, feats). score: callable → 大きい順 top-n を買う(¥100)。"""
+    ranked = sorted(items, key=lambda it: -score(it))[:n]
+    agg = defaultdict(lambda: [0.0, 0.0])
+    for rid, pay, _ in ranked:
+        agg[rid][0] += 100; agg[rid][1] += pay
+    return {k: tuple(v) for k, v in agg.items()}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--cand", nargs="+", required=True, help="place 候補CSV(p_fund の出どころ)")
+    ap.add_argument("--from", dest="d0", default="20250901"); ap.add_argument("--to", dest="d1", default="20260831")
+    ap.add_argument("--fit-to", required=True, help="YYYYMMDD。これ以前で fit")
+    ap.add_argument("--eval-from", required=True, help="YYYYMMDD。これ以降で eval")
+    ap.add_argument("--lead-sec", type=int, default=30, help="決定時点 = 発走 −これ秒")
+    ap.add_argument("--flow-min", type=int, default=5, help="フローの起点 = 発走 −これ分")
+    ap.add_argument("--top-frac", type=float, default=0.10, help="eval 内で買う割合(同一本数比較)")
+    args = ap.parse_args()
+
+    pf = load_cand(args.cand)
+    db = FeatureDB(load_features_config())
+    try:
+        rows = db.query(SQL, {"d0": args.d0, "d1": args.d1, "lead": args.lead_sec, "flow": args.flow_min})
+    finally:
+        db.close()
+    # レース内シェアで flow を作る
+    by_race = defaultdict(list)
+    for r in rows:
+        by_race[r["rid"]].append(r)
+    items = []   # (rid, pay, dict)
+    miss = 0
+    for rid, rs in by_race.items():
+        s1 = sum(1 / float(r["q1"]) for r in rs); s0 = sum(1 / float(r["q0"]) for r in rs)
+        for r in rs:
+            p_fund = pf.get((rid, f"{int(r['umaban']):02d}"))
+            if p_fund is None:
+                miss += 1; continue
+            q1 = float(r["q1"]); share1 = (1 / q1) / s1; share0 = (1 / float(r["q0"])) / s0
+            pay = int(str(r["pay"]).strip()) if r["pay"] is not None and str(r["pay"]).strip().isdigit() else 0
+            items.append((rid, pay, {"ymd": rid[:8], "q1": q1, "qimp": min(0.8 / q1, 0.98),
+                                     "flow": lg(share1) - lg(share0), "pf": p_fund}))
+    print(f"ts_o1 結合 {len(rows):,} 行 → p_fund あり {len(items):,} (欠落 {miss:,})   "
+          f"決定時点 T−{args.lead_sec}s, フロー起点 T−{args.flow_min}m")
+    fit = [it for it in items if it[2]["ymd"] <= args.fit_to]
+    ev = [it for it in items if it[2]["ymd"] >= args.eval_from]
+    print(f"fit {len(fit):,} 本 / eval {len(ev):,} 本 ({len({i[0] for i in ev}):,} レース)")
+
+    def design(its, with_flow):
+        cols = [np.ones(len(its)),
+                np.array([lg(i[2]["qimp"]) for i in its]),
+                np.array([lg(i[2]["pf"]) for i in its])]
+        if with_flow:
+            cols.append(np.array([i[2]["flow"] for i in its]))
+        return np.column_stack(cols)
+    y = np.array([1.0 if i[1] > 0 else 0.0 for i in fit])
+    wB = irls(design(fit, False), y); wF = irls(design(fit, True), y)
+    print(f"  Benter(snap) : logit p* = {wB[0]:+.3f} + {wB[1]:.3f}·logit(q_snap) + {wB[2]:.3f}·logit(p_fund)")
+    print(f"  +flow        : logit p* = {wF[0]:+.3f} + {wF[1]:.3f}·logit(q_snap) + {wF[2]:.3f}·logit(p_fund) + {wF[3]:+.3f}·flow")
+
+    def pstar(w, it, with_flow):
+        z = w[0] + w[1] * lg(it[2]["qimp"]) + w[2] * lg(it[2]["pf"]) + (w[3] * it[2]["flow"] if with_flow else 0)
+        return 1 / (1 + math.exp(-z))
+    n = max(1, int(len(ev) * args.top_frac))
+    base = agg_topn(ev, lambda it: it[2]["pf"], n)
+    variants = [
+        ("生p_fund EV順(q_snap)", lambda it: it[2]["pf"] * it[2]["q1"]),
+        ("Benter(snap) EV順",     lambda it: pstar(wB, it, False) * it[2]["q1"]),
+        ("Benter+flow EV順",      lambda it: pstar(wF, it, True) * it[2]["q1"]),
+        ("flow 単独(順位)",        lambda it: it[2]["flow"]),
+    ]
+    print(f"\n[eval 同一本数 top-{n:,}  基準=生 p_fund 確率順]  EV は q_snap(決定時点のオッズ)で計算、払戻は実際")
+    for name, sc in variants:
+        aggX = agg_topn(ev, sc, n)
+        ra, rb, d, lo, hi, pp = paired(base, aggX)
+        print(f"  {name:<22} ROI {ra:.4f} → {rb:.4f}  差={d:+.4f} [{lo:+.4f},{hi:+.4f}]  P(差<=0)={pp:.3f}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
