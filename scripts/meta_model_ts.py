@@ -62,7 +62,7 @@ SELECT s1.year||s1.month_day||s1.jyo_cd||s1.kaiji||s1.nichiji||s1.race_num AS ri
        (SELECT h.pay FROM nl_hr h
          WHERE (h.year,h.month_day,h.jyo_cd,h.kaiji,h.nichiji,h.race_num)
              = (s1.year,s1.month_day,s1.jyo_cd,s1.kaiji,s1.nichiji,s1.race_num)
-           AND h.bet_type='fuku' AND regexp_replace(h.kumi,'[^0-9]','','g') = s1.umaban LIMIT 1) AS pay
+           AND h.bet_type=%(hr)s AND regexp_replace(h.kumi,'[^0-9]','','g') = s1.umaban LIMIT 1) AS pay
 FROM s1 JOIN s0 USING (year,month_day,jyo_cd,kaiji,nichiji,race_num,umaban)
 """
 
@@ -141,6 +141,10 @@ def main() -> int:
     ap.add_argument("--eval-from", default=None, help="YYYYMMDD。これ以降で eval(--rolling 時は不要)")
     ap.add_argument("--lead-sec", type=int, default=30, help="決定時点 = 発走 −これ秒")
     ap.add_argument("--flow-min", type=int, default=5, help="フローの起点 = 発走 −これ分")
+    ap.add_argument("--bet-type", choices=("place", "win"), default="place",
+                    help="賭ける券種。★信号(flow_tan)は単勝プールから取るので、複勝で賭ければ信号源と"
+                         "別プール=自己投票が信号を汚さない。単勝で賭けると同じプールを自分で動かす。"
+                         "両方で効くなら信号が本物である強い傍証(控除率はどちらも20%)")
     ap.add_argument("--top-frac", type=float, default=0.10, help="eval 内で買う割合(同一本数比較)")
     ap.add_argument("--rolling", action="store_true",
                     help="月単位の拡大窓ローリング。各 eval 月について『その月より前の全データ』で fit し、"
@@ -154,7 +158,9 @@ def main() -> int:
     pf = load_cand(args.cand)
     db = FeatureDB(load_features_config())
     try:
-        rows = db.query(SQL, {"d0": args.d0, "d1": args.d1, "lead": args.lead_sec, "flow": args.flow_min})
+        rows = db.query(SQL, {"d0": args.d0, "d1": args.d1, "lead": args.lead_sec,
+                              "flow": args.flow_min,
+                              "hr": "fuku" if args.bet_type == "place" else "tan"})
     finally:
         db.close()
     # レース内シェアで flow を作る
@@ -183,6 +189,10 @@ def main() -> int:
             if p_fund is None:
                 miss += 1; continue
             q1 = float(r["q1"]); share1 = (1 / q1) / s1; share0 = (1 / float(r["q0"])) / s0
+            # EV に使うオッズは賭ける券種のもの。単勝なら tan1(決定時点の単勝オッズ)
+            q_bet = q1 if args.bet_type == "place" else (float(r["tan1"]) if r["tan1"] else None)
+            if q_bet is None:
+                miss += 1; continue
             flow_p = lg(share1) - lg(share0)
             if r["tan1"] and r["tan0"] and ts1 > 0 and ts0 > 0:
                 flow_t = lg((1 / float(r["tan1"])) / ts1) - lg((1 / float(r["tan0"])) / ts0)
@@ -194,13 +204,13 @@ def main() -> int:
             #   = Hausch–Ziemba の place/show 非効率。確定オッズは決定時点に見えないが、
             #   同じ乖離を T−60s で測れば使える(単勝・複勝とも見えている)。1時点で済むので運用が単純。
             xlv = (lg((1 / float(r["tan1"])) / ts1) - lg(share1)) if (r["tan1"] and ts1 > 0) else 0.0
-            items.append((rid, pay, {"ymd": rid[:8], "q1": q1, "qimp": min(0.8 / q1, 0.98),
+            items.append((rid, pay, {"ymd": rid[:8], "q1": q_bet, "qimp": min(0.8 / q_bet, 0.98),
                                      "flow": flow_p, "flow_tan": flow_t,
                                      "xpool": flow_t - flow_p,   # 変化の差(単勝が先行し複勝が未反応)
                                      "xpool_level": xlv,         # 水準の差(決定時点の乖離そのもの)
                                      "pf": p_fund}))
-    print(f"ts_o1 結合 {len(rows):,} 行 → p_fund あり {len(items):,} (欠落 {miss:,})   "
-          f"決定時点 T−{args.lead_sec}s, フロー起点 T−{args.flow_min}m")
+    print(f"ts_o1 結合 {len(rows):,} 行 → 有効 {len(items):,} (欠落 {miss:,})   "
+          f"券種={args.bet_type}, 決定時点 T−{args.lead_sec}s, フロー起点 T−{args.flow_min}m")
     def design(its, with_flow):
         cols = [np.ones(len(its)),
                 np.array([lg(i[2]["qimp"]) for i in its]),
