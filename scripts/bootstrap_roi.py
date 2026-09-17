@@ -67,8 +67,8 @@ def main() -> int:
         return 1
 
     by_race: dict[str, list[int]] = defaultdict(list)
-    for _bt, _er, _p, _o, pay, rid in sel:
-        by_race[rid].append(pay)
+    for t in sel:                        # t=(bet_type, er, prob, odds, payout, race_id, career)
+        by_race[t[5]].append(t[4])
     races = list(by_race.values())
     n_bets = len(sel)
     hits = sum(1 for t in sel if t[4] > 0)

@@ -20,6 +20,8 @@ from __future__ import annotations
 import argparse
 import csv
 from collections import defaultdict
+
+import numpy as np
 from statistics import median
 
 
@@ -140,7 +142,6 @@ def main() -> int:
 
     # レース単位に先に集計してから numpy でベクトル化する。
     # 1反復ごとに全馬券を舐めると iters × bets = 28億回になって終わらない。
-    import numpy as np
 
     top = Q - 1
     sh = np.array([sum(100 for q, _ in r if q == top) for r in races], dtype=np.float64)
