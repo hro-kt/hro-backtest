@@ -133,6 +133,38 @@ def agg_topn(items, score, n):
     return {k: tuple(v) for k, v in agg.items()}
 
 
+COMBO_SQL = """
+SELECT (o.year||o.month_day||o.jyo_cd||o.kaiji||o.nichiji||o.race_num) rid,
+       o.kumi, {odds_expr} AS odds,
+       (SELECT h.pay FROM nl_hr h
+         WHERE (h.year,h.month_day,h.jyo_cd,h.kaiji,h.nichiji,h.race_num)
+             = (o.year,o.month_day,o.jyo_cd,o.kaiji,o.nichiji,o.race_num)
+           AND h.bet_type=%(hr)s AND regexp_replace(h.kumi,'[^0-9]','','g') = o.kumi LIMIT 1) AS pay
+FROM {tbl} o
+WHERE (o.year||o.month_day||o.jyo_cd||o.kaiji||o.nichiji||o.race_num) = ANY(%(ids)s)
+  AND {odds_raw} ~ '^[0-9]+$' AND {odds_raw}::numeric > 0
+"""
+
+
+def load_combos(db, rids, bet_type):
+    """組の確定オッズと払戻。kumi は '0102'(ワイド) / '010203'(三連複) の数字連結。"""
+    if bet_type == "wide":
+        tbl, raw, hr, legs = "nl_o3", "o.odds_low", "wide", 2
+    else:
+        tbl, raw, hr, legs = "nl_o5", "o.odds", "sanrenfuku", 3
+    sql = COMBO_SQL.format(tbl=tbl, odds_raw=raw, odds_expr=f"{raw}::numeric/10.0")
+    out = []
+    for i in range(0, len(rids), 800):
+        for r in db.query(sql, {"ids": rids[i:i + 800], "hr": hr}):
+            k = r["kumi"]
+            if len(k) != legs * 2 or not k.isdigit():
+                continue
+            ums = tuple(f"{int(k[j*2:j*2+2]):02d}" for j in range(legs))
+            pay = int(str(r["pay"]).strip()) if r["pay"] and str(r["pay"]).strip().isdigit() else 0
+            out.append((r["rid"], ums, float(r["odds"]), pay))
+    return out
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--cand", nargs="+", required=True, help="place 候補CSV(p_fund の出どころ)")
@@ -141,10 +173,14 @@ def main() -> int:
     ap.add_argument("--eval-from", default=None, help="YYYYMMDD。これ以降で eval(--rolling 時は不要)")
     ap.add_argument("--lead-sec", type=int, default=30, help="決定時点 = 発走 −これ秒")
     ap.add_argument("--flow-min", type=int, default=5, help="フローの起点 = 発走 −これ分")
-    ap.add_argument("--bet-type", choices=("place", "win"), default="place",
+    ap.add_argument("--bet-type", choices=("place", "win", "wide", "trio"), default="place",
                     help="賭ける券種。★信号(flow_tan)は単勝プールから取るので、複勝で賭ければ信号源と"
                          "別プール=自己投票が信号を汚さない。単勝で賭けると同じプールを自分で動かす。"
-                         "両方で効くなら信号が本物である強い傍証(控除率はどちらも20%)")
+                         "両方で効くなら信号が本物である強い傍証(控除率はどちらも20%)。"
+                         "wide/trio は組の券種: 信号は単勝プール(ts_o1)から作り、"
+                         "組のスコアは構成馬の flow_tan の**最小値**(全頭が買われている組だけを採る)。"
+                         "★決定時点のワイド/三連複オッズは時系列が無い(ts_sokuho_o3/o5 は5日分)ので"
+                         "確定オッズで EV を計算する＝**楽観側の上限測定**。効いてから運用形を考える")
     ap.add_argument("--top-frac", type=float, default=0.10, help="eval 内で買う割合(同一本数比較)")
     ap.add_argument("--rolling", action="store_true",
                     help="月単位の拡大窓ローリング。各 eval 月について『その月より前の全データ』で fit し、"
@@ -215,6 +251,34 @@ def main() -> int:
                                      "pf": p_fund}))
     print(f"ts_o1 結合 {len(rows):,} 行 → 有効 {len(items):,} (欠落 {miss:,})   "
           f"券種={args.bet_type}, 決定時点 T−{args.lead_sec}s, フロー起点 T−{args.flow_min}m")
+
+    if args.bet_type in ("wide", "trio"):
+        # 馬ごとの flow_tan を引けるようにして、組に展開し直す。
+        # 組のスコア = 構成馬の flow_tan の**最小値**(一部の脚だけ買われている組を除く)。
+        # EV のオッズは確定オッズ(決定時点の組オッズは時系列が無い)＝楽観側の上限測定。
+        per_horse = {(rid, f["um"]): f for rid, _p, f in items}
+        db2 = FeatureDB(load_features_config())
+        try:
+            combos = load_combos(db2, sorted({rid for rid, _p, _f in items}), args.bet_type)
+        finally:
+            db2.close()
+        new_items, dropped = [], 0
+        for rid, ums, odds, pay in combos:
+            fs = [per_horse.get((rid, u)) for u in ums]
+            if any(f is None for f in fs):
+                dropped += 1; continue
+            new_items.append((rid, pay, {
+                "ymd": rid[:8], "um": "-".join(ums), "q1": odds,
+                "qimp": min((1 - 0.225 if args.bet_type == "wide" else 1 - 0.25) / odds, 0.98),
+                "flow": min(f["flow"] for f in fs),
+                "flow_tan": min(f["flow_tan"] for f in fs),
+                "xpool": min(f["xpool"] for f in fs),
+                "xpool_level": min(f["xpool_level"] for f in fs),
+                "pf": max(min(f["pf"] for f in fs), 1e-6),
+            }))
+        items = new_items
+        print(f"  → {args.bet_type} の組に展開: {len(items):,} 点 "
+              f"(脚の flow が引けず除外 {dropped:,})  組スコア=構成馬の最小 flow_tan")
     def design(its, with_flow):
         cols = [np.ones(len(its)),
                 np.array([lg(i[2]["qimp"]) for i in its]),
