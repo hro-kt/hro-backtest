@@ -81,102 +81,76 @@ def main() -> int:
     for (rid, um), v in votes.items():
         pool[rid] += v
 
-    def payout(rid, um, extra_yen=0.0):
-        """予測払戻(100円あたり)。extra_yen は自分の投入額。"""
-        s_i = votes.get((rid, um), 0) * 100.0 + extra_yen
-        if s_i <= 0 or rid not in pool:
-            return None
-        P = pool[rid] * 100.0 + extra_yen
-        pl = placed.get(rid) or set()
-        if not pl or um not in pl:
-            return None
-        k = len(pl)
-        s_placed = sum(votes.get((rid, u), 0) * 100.0 for u in pl) + extra_yen
-        prof = P * (1 - TAKEOUT) - s_placed
-        if prof <= 0:
-            return 100.0
-        return 100.0 + (prof / k) / s_i * 100.0
+    # ★払戻式は当てにいかない。実払戻から「その馬の配当原資」を逆算する:
+    #     原資_i = (実払戻 − 100)/100 × 自馬票数(円)
+    #   自分が X 円入れると 自馬票数 += X、プール += X で、原資は控除率ぶんだけ目減りする:
+    #     新払戻 = 100 + [原資_i − (1−r)·X/k] ÷ (自馬票数 + X) × 100
+    #   支配的なのは分母の希釈で、これは票数と実払戻だけで決まる(式の形を知らなくてよい)。
+    UNIT = 100.0   # 票数は100円単位(JV-Data 票数=枚数)。下の検証で妥当性を確認する
 
-    # ① 票数ブロックと払戻式を**同時に**検証する。
-    #    nl_o1 に複勝オッズの下限/上限があるのは、払戻が「他にどの馬が来るか」に依存するから。
-    #    = 利益を着内頭数で割る形でなければ幅が出ない(プールを単純に割る式なら定数になる)。
-    #    下限 = 他の着内馬が最も売れている2頭のとき、上限 = 最も売れていない2頭のとき。
-    #    これが nl_o1 と一致すれば、[503] が複勝票数であることと式の形が同時に確定する。
-    def bounds(rid, um, k):
-        s_i = votes.get((rid, um), 0) * 100.0
-        if s_i <= 0:
-            return None
-        others = sorted(v * 100.0 for (r2, u2), v in votes.items() if r2 == rid and u2 != um)
-        if len(others) < k - 1:
-            return None
-        P = pool[rid] * 100.0
-        hi_others = sum(others[-(k - 1):])   # 最も売れている → 払戻は下限
-        lo_others = sum(others[:k - 1])      # 最も売れていない → 払戻は上限
-        def f(o):
-            prof = P * (1 - TAKEOUT) - (s_i + o)
-            return 100.0 + (prof / k) / s_i * 100.0 if prof > 0 else 100.0
-        return f(hi_others), f(lo_others)
-
-    okl = okh = totb = 0; errl = []
-    for r in db_o1_rows:
-        rid, um = r["rid"], r["um"]
-        k = 3 if int(r["fs"] or 0) >= 8 else 2
-        bd = bounds(rid, um, k)
-        if bd is None or not r["lo"] or not r["hi"]:
-            continue
-        totb += 1
-        pl, ph = bd
-        lo_a, hi_a = float(r["lo"]), float(r["hi"])   # psycopg は numeric を Decimal で返す
-        okl += abs(pl - lo_a) / lo_a < 0.03
-        okh += abs(ph - hi_a) / hi_a < 0.03
-        errl.append(abs(pl - lo_a) / lo_a)
-    if totb:
-        errl.sort()
-        print(f"\n[票数ブロック+式の検証] nl_o1 の複勝オッズ下限/上限を票数から予測: n={totb:,}  "
-              f"下限一致 {okl/totb:.1%}  上限一致 {okh/totb:.1%}  下限の中央誤差 {errl[len(errl)//2]:.2%}")
-        if okl / totb < 0.9:
-            print("  ★一致しない。[503] が複勝票数でないか、控除率/着内頭数が違う。"
-                  "probe で複勝ブロックを総当たり検証すること")
-    else:
-        print("\n[票数ブロック+式の検証] 検証データが取れませんでした")
-
-    # ② 式の検証: 実払戻(nl_hr)と一致するか
-    ok = tot = 0; err = []
-    for rid, um, _pay in sel:
-        pr = payout(rid, um)
+    def share_yen(rid, um):
+        s_i = votes.get((rid, um), 0) * UNIT
         ac = actual.get((rid, um))
-        if pr is None or ac is None:
+        if s_i <= 0 or ac is None:
+            return None
+        return (ac - 100.0) / 100.0 * s_i, s_i
+
+    # 検証: 着内馬の原資合計 ≈ プール×(1−r) − 着内馬の票数合計 (単位・控除率・着内頭数の妥当性)
+    rel = []
+    for rid in {r for r, _ in votes}:
+        pl = placed.get(rid) or set()
+        if not pl:
             continue
-        tot += 1
-        e = abs(pr - ac) / max(ac, 1)
-        ok += e < 0.03
-        err.append(e)
-    if not tot:
-        print("★検証できる的中馬券がありません(nl_h1/nl_hr の突合に失敗)")
-        return 1
-    err.sort()
-    print(f"\n[式の検証] 的中 {tot:,} 件で予測払戻 vs 実払戻(nl_hr): "
-          f"3%以内一致 {ok:,}/{tot:,} = {ok/tot:.1%}  中央誤差 {err[len(err)//2]:.2%}")
-    if ok / tot < 0.9:
-        print("★式が合っていません。控除率/着内頭数/票数の単位を見直すこと。以下は参考値です。")
+        tot_share = 0.0; tot_s = 0.0; okall = True
+        for u in pl:
+            sv = share_yen(rid, u)
+            if sv is None:
+                okall = False; break
+            tot_share += sv[0]; tot_s += sv[1]
+        if not okall:
+            continue
+        P = pool[rid] * UNIT
+        expect = P * (1 - TAKEOUT) - tot_s
+        if expect > 0:
+            rel.append(tot_share / expect)
+    if rel:
+        rel.sort()
+        med = rel[len(rel) // 2]
+        inb = sum(1 for x in rel if 0.95 < x < 1.05) / len(rel)
+        print(f"\n[単位・控除率の検証] 着内馬の配当原資合計 ÷ (プール×{1-TAKEOUT:.1f} − 着内票数合計): "
+              f"n={len(rel):,}  中央値 {med:.3f}  ±5%内 {inb:.1%}")
+        if not (0.9 < med < 1.1):
+            print(f"  ★1.0 から離れている。票数単位({int(UNIT)}円)か控除率({TAKEOUT})が違う可能性。"
+                  "比が一定なら下の ROI の**傾き**は使えるが、水準は補正が要る")
+    else:
+        print("\n[単位・控除率の検証] 検証できる的中レースがありません")
 
     # ② 賭け金ごとの ROI
     print(f"\n[賭け金ごとの ROI]  基準は ¥100(自己インパクト無視)")
-    base_ret = sum(p for _r, _u, p in sel)
     n = len(sel)
-    print(f"  {'1点':>9}{'総投資':>12}{'ROI':>8}{'利益':>12}   的中時の平均払戻(100円あたり)")
+    base_ret = sum(p for _r, _u, p in sel)
+    miss = sum(1 for rid, um, pay in sel if pay > 0 and share_yen(rid, um) is None)
+    print(f"  {'1点':>9}{'総投資':>12}{'ROI':>8}{'利益':>14}   的中時の平均払戻(100円あたり)")
     for x in (float(v) for v in args.stakes.split(",")):
         ret = 0.0; pays = []
         for rid, um, pay in sel:
             if pay <= 0:
                 continue
-            pr = payout(rid, um, extra_yen=x)
-            use = pr if pr is not None else float(pay)
+            sv = share_yen(rid, um)
+            if sv is None:                      # 票数が無い → 希釈無しの実払戻で代替
+                use = float(pay)
+            else:
+                share, s_i = sv
+                k = max(len(placed.get(rid) or {1}), 1)
+                use = 100.0 + (share - (1 - TAKEOUT) * x / k) / (s_i + x) * 100.0
+                use = max(use, 100.0)           # JRA は元本割れ無し(最低100円)
             pays.append(use)
             ret += x / 100.0 * use
         roi = ret / (n * x)
-        print(f"  {int(x):>9,}{int(n*x):>12,}{roi:>8.4f}{int(ret - n*x):>12,}   "
+        print(f"  {int(x):>9,}{int(n*x):>12,}{roi:>8.4f}{int(ret - n*x):>14,}   "
               f"{sum(pays)/max(len(pays),1):>8.1f}")
+    if miss:
+        print(f"  ※ 票数が引けず希釈を計算できなかった的中: {miss:,} 件(実払戻で代替=自己インパクト過小)")
     print(f"\n  ¥100 時の実績 ROI(参考, 実払戻ベース)= {base_ret/(n*100):.4f}")
     print("  ※ 単勝プールから取った信号で複勝を買うので、自己投票は信号源を汚さない(払戻だけが下がる)")
     return 0
