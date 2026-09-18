@@ -151,6 +151,9 @@ def main() -> int:
                          "月ごとに top-frac を買って全月をプール。eval を 4ヶ月→8ヶ月に増やし月別の再現も見る"
                          "(ts_o1 は1年しか無く、単一分割の eval 1,371本では CI が ±0.2 で判定不能だった)")
     ap.add_argument("--min-fit-months", type=int, default=4, help="ローリングの最小 fit 月数")
+    ap.add_argument("--dump-selections", default=None,
+                    help="採用した馬券を CSV 出力(自己インパクト計算 self_impact.py の入力)")
+    ap.add_argument("--dump-variant", default="flow_tan 単独(単勝プール)", help="出力する変種名")
     args = ap.parse_args()
     if not args.rolling and not (args.fit_to and args.eval_from):
         ap.error("--rolling を使わない場合は --fit-to と --eval-from が要ります")
@@ -204,7 +207,8 @@ def main() -> int:
             #   = Hausch–Ziemba の place/show 非効率。確定オッズは決定時点に見えないが、
             #   同じ乖離を T−60s で測れば使える(単勝・複勝とも見えている)。1時点で済むので運用が単純。
             xlv = (lg((1 / float(r["tan1"])) / ts1) - lg(share1)) if (r["tan1"] and ts1 > 0) else 0.0
-            items.append((rid, pay, {"ymd": rid[:8], "q1": q_bet, "qimp": min(0.8 / q_bet, 0.98),
+            items.append((rid, pay, {"ymd": rid[:8], "um": f"{int(r['umaban']):02d}",
+                                     "q1": q_bet, "qimp": min(0.8 / q_bet, 0.98),
                                      "flow": flow_p, "flow_tan": flow_t,
                                      "xpool": flow_t - flow_p,   # 変化の差(単勝が先行し複勝が未反応)
                                      "xpool_level": xlv,         # 水準の差(決定時点の乖離そのもの)
@@ -304,6 +308,14 @@ def main() -> int:
     for r in per_month:
         print(f"  {r['m']:<8}{r['n']:>6,}{r['base']:>8.3f}" + "".join(f"{r[nm]:>12.3f}" for nm in NAMES)
               + f"{r['wB1']:>9.3f}{r['wF3']:>9.3f}")
+    if args.dump_selections:
+        import csv as _csv
+        with open(args.dump_selections, "w", newline="", encoding="utf-8") as f:
+            w = _csv.writer(f); w.writerow(["race_id", "umaban", "payout", "odds_snap", "ymd"])
+            for rid, pay, ft in sel_all.get(args.dump_variant, []):
+                w.writerow([rid, ft["um"], pay, f"{ft['q1']:.1f}", ft["ymd"]])
+        print(f"\n採用馬券 {len(sel_all.get(args.dump_variant, [])):,} 件 → {args.dump_selections}"
+              f"  (変種: {args.dump_variant})")
     base_all = {k: tuple(v) for k, v in base_all.items()}
     agg_all = {nm: {k: tuple(v) for k, v in d.items()} for nm, d in agg_all.items()}
     report(base_all, agg_all, sel_all, f"全 {len(per_month)} ヶ月をプール")
