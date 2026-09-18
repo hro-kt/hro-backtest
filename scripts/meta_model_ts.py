@@ -124,9 +124,22 @@ def paired(aggA, aggB, iters=10000, seed=42):
     return ra, rb, rb - ra, float(d[int(.025 * iters)]), float(d[int(.975 * iters)]), float((d <= 0).mean())
 
 
-def agg_topn(items, score, n):
-    """items: list of (rid, pay, feats). score: callable → 大きい順 top-n を買う(¥100)。"""
-    ranked = sorted(items, key=lambda it: -score(it))[:n]
+def agg_topn(items, score, n, per_race=0):
+    """items: list of (rid, pay, feats)。score の大きい順に買う(¥100)。
+
+    per_race>0 なら **1レースあたり上位 per_race 点**(全体 top-n ではなく)。
+    top-frac 方式はレースによって0点〜十数点とばらつき、運用ルールに落ちない。
+    また「特定レースへの集中」か「広く薄く効く」かの区別もつかない。
+    """
+    if per_race > 0:
+        by_r = defaultdict(list)
+        for it in items:
+            by_r[it[0]].append(it)
+        ranked = []
+        for _rid, v in by_r.items():
+            ranked += sorted(v, key=lambda it: -score(it))[:per_race]
+    else:
+        ranked = sorted(items, key=lambda it: -score(it))[:n]
     agg = defaultdict(lambda: [0.0, 0.0])
     for rid, pay, _ in ranked:
         agg[rid][0] += 100; agg[rid][1] += pay
@@ -182,6 +195,9 @@ def main() -> int:
                          "★決定時点のワイド/三連複オッズは時系列が無い(ts_sokuho_o3/o5 は5日分)ので"
                          "確定オッズで EV を計算する＝**楽観側の上限測定**。効いてから運用形を考える")
     ap.add_argument("--top-frac", type=float, default=0.10, help="eval 内で買う割合(同一本数比較)")
+    ap.add_argument("--per-race", type=int, default=0,
+                    help="1レースあたり上位N点を買う(>0 で --top-frac より優先)。"
+                         "運用ルールに直結し、特定レースへの集中か広く薄くかも区別できる")
     ap.add_argument("--rolling", action="store_true",
                     help="月単位の拡大窓ローリング。各 eval 月について『その月より前の全データ』で fit し、"
                          "月ごとに top-frac を買って全月をプール。eval を 4ヶ月→8ヶ月に増やし月別の再現も見る"
@@ -330,10 +346,10 @@ def main() -> int:
         print(f"  Benter(snap) : logit p* = {wB[0]:+.3f} + {wB[1]:.3f}·logit(q_snap) + {wB[2]:.3f}·logit(p_fund)")
         print(f"  +flow        : logit p* = {wF[0]:+.3f} + {wF[1]:.3f}·logit(q_snap) + {wF[2]:.3f}·logit(p_fund) + {wF[3]:+.3f}·flow")
         n = max(1, int(len(ev) * args.top_frac))
-        base = agg_topn(ev, lambda it: it[2]["pf"], n)
+        base = agg_topn(ev, lambda it: it[2]["pf"], n, args.per_race)
         agg_by, sel_by = {}, {}
         for nm, sc in variants_for(wB, wF):
-            agg_by[nm] = agg_topn(ev, sc, n)
+            agg_by[nm] = agg_topn(ev, sc, n, args.per_race)
             sel_by[nm] = sorted(ev, key=lambda it: -sc(it))[:n]
         report(base, agg_by, sel_by, f"eval 同一本数 top-{n:,}  基準=生 p_fund 確率順")
         return 0
@@ -354,15 +370,23 @@ def main() -> int:
             continue
         wB, wF = fit_weights(fit)
         n = max(1, int(len(ev) * args.top_frac))
-        b = agg_topn(ev, lambda it: it[2]["pf"], n)
+        b = agg_topn(ev, lambda it: it[2]["pf"], n, args.per_race)
         for rid, (st, pa) in b.items():
             base_all[rid][0] += st; base_all[rid][1] += pa
-        row = {"m": m, "n": n, "fit": len(fit), "wB1": wB[1], "wF3": wF[3]}
+        row = {"m": m, "n": (len({i[0] for i in ev}) * args.per_race if args.per_race else n),
+               "fit": len(fit), "wB1": wB[1], "wF3": wF[3]}
         for nm, sc in variants_for(wB, wF):
-            a = agg_topn(ev, sc, n)
+            a = agg_topn(ev, sc, n, args.per_race)
             for rid, (st, pa) in a.items():
                 agg_all[nm][rid][0] += st; agg_all[nm][rid][1] += pa
-            sel_all[nm] += sorted(ev, key=lambda it: -sc(it))[:n]
+            if args.per_race > 0:
+                _by = defaultdict(list)
+                for _it in ev:
+                    _by[_it[0]].append(_it)
+                for _rid, _v in _by.items():
+                    sel_all[nm] += sorted(_v, key=lambda it: -sc(it))[:args.per_race]
+            else:
+                sel_all[nm] += sorted(ev, key=lambda it: -sc(it))[:n]
             row[nm] = sum(v[1] for v in a.values()) / sum(v[0] for v in a.values())
         row["base"] = sum(v[1] for v in b.values()) / sum(v[0] for v in b.values())
         per_month.append(row)
