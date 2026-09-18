@@ -120,15 +120,16 @@ def main() -> int:
     okl = okh = totb = 0; errl = []
     for r in db_o1_rows:
         rid, um = r["rid"], r["um"]
-        k = 3 if (r["fs"] or 0) >= 8 else 2
+        k = 3 if int(r["fs"] or 0) >= 8 else 2
         bd = bounds(rid, um, k)
         if bd is None or not r["lo"] or not r["hi"]:
             continue
         totb += 1
         pl, ph = bd
-        okl += abs(pl - r["lo"]) / r["lo"] < 0.03
-        okh += abs(ph - r["hi"]) / r["hi"] < 0.03
-        errl.append(abs(pl - r["lo"]) / r["lo"])
+        lo_a, hi_a = float(r["lo"]), float(r["hi"])   # psycopg は numeric を Decimal で返す
+        okl += abs(pl - lo_a) / lo_a < 0.03
+        okh += abs(ph - hi_a) / hi_a < 0.03
+        errl.append(abs(pl - lo_a) / lo_a)
     if totb:
         errl.sort()
         print(f"\n[票数ブロック+式の検証] nl_o1 の複勝オッズ下限/上限を票数から予測: n={totb:,}  "
