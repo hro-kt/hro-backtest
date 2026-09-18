@@ -124,12 +124,28 @@ def paired(aggA, aggB, iters=10000, seed=42):
     return ra, rb, rb - ra, float(d[int(.025 * iters)]), float(d[int(.975 * iters)]), float((d <= 0).mean())
 
 
+def pick(items, score, thr):
+    """score が絶対閾値 thr 以上のものを全部買う(¥100)。運用でそのまま実行できる形。
+
+    ★top-frac(eval期間全体の上位◯%)は**未来のスコア分布を知らないと閾値が決まらない**ので
+      実運用では使えない定義だった。fit 期間で決めた絶対値を eval に適用する。
+      1レース固定N点だと信号の弱いレースでも無理に買って薄まる(実測: 複勝 1.17→1.006)。
+      効果の大半は「どのレースで賭けるか」の選別が担っている。
+    """
+    return [it for it in items if score(it) >= thr]
+
+
+def agg_from(sel):
+    agg = defaultdict(lambda: [0.0, 0.0])
+    for rid, pay, _f in sel:
+        agg[rid][0] += 100; agg[rid][1] += pay
+    return {k: tuple(v) for k, v in agg.items()}
+
+
 def agg_topn(items, score, n, per_race=0):
     """items: list of (rid, pay, feats)。score の大きい順に買う(¥100)。
 
     per_race>0 なら **1レースあたり上位 per_race 点**(全体 top-n ではなく)。
-    top-frac 方式はレースによって0点〜十数点とばらつき、運用ルールに落ちない。
-    また「特定レースへの集中」か「広く薄く効く」かの区別もつかない。
     """
     if per_race > 0:
         by_r = defaultdict(list)
@@ -195,6 +211,9 @@ def main() -> int:
                          "★決定時点のワイド/三連複オッズは時系列が無い(ts_sokuho_o3/o5 は5日分)ので"
                          "確定オッズで EV を計算する＝**楽観側の上限測定**。効いてから運用形を考える")
     ap.add_argument("--top-frac", type=float, default=0.10, help="eval 内で買う割合(同一本数比較)")
+    ap.add_argument("--thr-quantile", type=float, default=None,
+                    help="fit 期間のスコア分布のこの上側分位(例 0.99)を**絶対閾値**にして eval に適用。"
+                         "未来を見ないので運用でそのまま実行できる。top-frac/per-race より優先")
     ap.add_argument("--per-race", type=int, default=0,
                     help="1レースあたり上位N点を買う(>0 で --top-frac より優先)。"
                          "運用ルールに直結し、特定レースへの集中か広く薄くかも区別できる")
@@ -356,7 +375,10 @@ def main() -> int:
 
     # ---- 拡大窓ローリング(月単位) ----
     months = sorted({it[2]["ymd"][:6] for it in items})
-    print(f"ローリング: 月 {months[0]}〜{months[-1]} ({len(months)}ヶ月), 最小fit {args.min_fit_months}ヶ月")
+    mode = (f"fit分位 {args.thr_quantile} の絶対閾値" if args.thr_quantile is not None
+            else (f"1R上位{args.per_race}点" if args.per_race else f"eval上位{args.top_frac:.0%}"))
+    print(f"ローリング: 月 {months[0]}〜{months[-1]} ({len(months)}ヶ月), 最小fit {args.min_fit_months}ヶ月, "
+          f"選別={mode}")
     base_all = defaultdict(lambda: [0.0, 0.0])
     agg_all = {nm: defaultdict(lambda: [0.0, 0.0]) for nm in NAMES}
     sel_all = {nm: [] for nm in NAMES}
@@ -370,16 +392,35 @@ def main() -> int:
             continue
         wB, wF = fit_weights(fit)
         n = max(1, int(len(ev) * args.top_frac))
-        b = agg_topn(ev, lambda it: it[2]["pf"], n, args.per_race)
+        use_thr = args.thr_quantile is not None
+        if use_thr:
+            # fit 期間の分位から各変種の絶対閾値を決める(eval のスコアは一切見ない)
+            thr = {}
+            for nm, sc in variants_for(wB, wF):
+                vals = sorted(sc(it) for it in fit)
+                thr[nm] = vals[min(len(vals) - 1, int(len(vals) * args.thr_quantile))]
+            bvals = sorted(it[2]["pf"] for it in fit)
+            thr_base = bvals[min(len(bvals) - 1, int(len(bvals) * args.thr_quantile))]
+            b = agg_from(pick(ev, lambda it: it[2]["pf"], thr_base))
+        else:
+            b = agg_topn(ev, lambda it: it[2]["pf"], n, args.per_race)
         for rid, (st, pa) in b.items():
             base_all[rid][0] += st; base_all[rid][1] += pa
-        row = {"m": m, "n": (len({i[0] for i in ev}) * args.per_race if args.per_race else n),
-               "fit": len(fit), "wB1": wB[1], "wF3": wF[3]}
+        row = {"m": m, "fit": len(fit), "wB1": wB[1], "wF3": wF[3],
+               "n": (len(pick(ev, lambda it: it[2]["flow_tan"], thr["flow_tan 単独(単勝プール)"]))
+                     if use_thr else
+                     (len({i[0] for i in ev}) * args.per_race if args.per_race else n))}
         for nm, sc in variants_for(wB, wF):
-            a = agg_topn(ev, sc, n, args.per_race)
+            if use_thr:
+                _sel = pick(ev, sc, thr[nm])
+                a = agg_from(_sel)
+            else:
+                a = agg_topn(ev, sc, n, args.per_race)
             for rid, (st, pa) in a.items():
                 agg_all[nm][rid][0] += st; agg_all[nm][rid][1] += pa
-            if args.per_race > 0:
+            if use_thr:
+                sel_all[nm] += _sel
+            elif args.per_race > 0:
                 _by = defaultdict(list)
                 for _it in ev:
                     _by[_it[0]].append(_it)
