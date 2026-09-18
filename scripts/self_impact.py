@@ -61,6 +61,19 @@ def main() -> int:
                 p = (r["pay"] or "").strip()
                 if p.isdigit():
                     actual[(r["rid"], um)] = int(p)
+        db_o1_rows = []
+        for i in range(0, len(rids), 2000):
+            ch = rids[i:i + 2000]
+            db_o1_rows += db.query("""
+                SELECT (o.year||o.month_day||o.jyo_cd||o.kaiji||o.nichiji||o.race_num) rid, o.umaban um,
+                       CASE WHEN o.fuku_odds_low  ~ '^[0-9]+$' AND o.fuku_odds_low::numeric>0
+                            THEN o.fuku_odds_low::numeric/10.0*100 END  lo,
+                       CASE WHEN o.fuku_odds_high ~ '^[0-9]+$' AND o.fuku_odds_high::numeric>0
+                            THEN o.fuku_odds_high::numeric/10.0*100 END hi,
+                       CASE WHEN r.syusso_tosu ~ '^[0-9]+$' THEN r.syusso_tosu::int END fs
+                FROM nl_o1 o JOIN nl_ra r USING (year,month_day,jyo_cd,kaiji,nichiji,race_num)
+                WHERE (o.year||o.month_day||o.jyo_cd||o.kaiji||o.nichiji||o.race_num) = ANY(%(ids)s)""",
+                {"ids": ch})
     finally:
         db.close()
 
@@ -84,7 +97,49 @@ def main() -> int:
             return 100.0
         return 100.0 + (prof / k) / s_i * 100.0
 
-    # ① 式の検証: 実払戻(nl_hr)と一致するか
+    # ① 票数ブロックと払戻式を**同時に**検証する。
+    #    nl_o1 に複勝オッズの下限/上限があるのは、払戻が「他にどの馬が来るか」に依存するから。
+    #    = 利益を着内頭数で割る形でなければ幅が出ない(プールを単純に割る式なら定数になる)。
+    #    下限 = 他の着内馬が最も売れている2頭のとき、上限 = 最も売れていない2頭のとき。
+    #    これが nl_o1 と一致すれば、[503] が複勝票数であることと式の形が同時に確定する。
+    def bounds(rid, um, k):
+        s_i = votes.get((rid, um), 0) * 100.0
+        if s_i <= 0:
+            return None
+        others = sorted(v * 100.0 for (r2, u2), v in votes.items() if r2 == rid and u2 != um)
+        if len(others) < k - 1:
+            return None
+        P = pool[rid] * 100.0
+        hi_others = sum(others[-(k - 1):])   # 最も売れている → 払戻は下限
+        lo_others = sum(others[:k - 1])      # 最も売れていない → 払戻は上限
+        def f(o):
+            prof = P * (1 - TAKEOUT) - (s_i + o)
+            return 100.0 + (prof / k) / s_i * 100.0 if prof > 0 else 100.0
+        return f(hi_others), f(lo_others)
+
+    okl = okh = totb = 0; errl = []
+    for r in db_o1_rows:
+        rid, um = r["rid"], r["um"]
+        k = 3 if (r["fs"] or 0) >= 8 else 2
+        bd = bounds(rid, um, k)
+        if bd is None or not r["lo"] or not r["hi"]:
+            continue
+        totb += 1
+        pl, ph = bd
+        okl += abs(pl - r["lo"]) / r["lo"] < 0.03
+        okh += abs(ph - r["hi"]) / r["hi"] < 0.03
+        errl.append(abs(pl - r["lo"]) / r["lo"])
+    if totb:
+        errl.sort()
+        print(f"\n[票数ブロック+式の検証] nl_o1 の複勝オッズ下限/上限を票数から予測: n={totb:,}  "
+              f"下限一致 {okl/totb:.1%}  上限一致 {okh/totb:.1%}  下限の中央誤差 {errl[len(errl)//2]:.2%}")
+        if okl / totb < 0.9:
+            print("  ★一致しない。[503] が複勝票数でないか、控除率/着内頭数が違う。"
+                  "probe で複勝ブロックを総当たり検証すること")
+    else:
+        print("\n[票数ブロック+式の検証] 検証データが取れませんでした")
+
+    # ② 式の検証: 実払戻(nl_hr)と一致するか
     ok = tot = 0; err = []
     for rid, um, _pay in sel:
         pr = payout(rid, um)
