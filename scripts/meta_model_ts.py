@@ -407,6 +407,7 @@ def main() -> int:
         for rid, (st, pa) in b.items():
             base_all[rid][0] += st; base_all[rid][1] += pa
         row = {"m": m, "fit": len(fit), "wB1": wB[1], "wF3": wF[3],
+               "thr_flow": (thr["flow_tan 単独(単勝プール)"] if use_thr else float("nan")),
                "n": (len(pick(ev, lambda it: it[2]["flow_tan"], thr["flow_tan 単独(単勝プール)"]))
                      if use_thr else
                      (len({i[0] for i in ev}) * args.per_race if args.per_race else n))}
@@ -433,10 +434,20 @@ def main() -> int:
         per_month.append(row)
 
     print(f"\n[月別 ROI]  {'月':<8}{'n':>6}{'基準':>8}" + "".join(f"{nm[:10]:>12}" for nm in NAMES)
-          + f"{'市場重み':>9}{'flow係数':>9}")
+          + f"{'市場重み':>9}{'flow係数':>9}" + (f"{'flow閾値':>10}" if args.thr_quantile is not None else ""))
     for r in per_month:
         print(f"  {r['m']:<8}{r['n']:>6,}{r['base']:>8.3f}" + "".join(f"{r[nm]:>12.3f}" for nm in NAMES)
-              + f"{r['wB1']:>9.3f}{r['wF3']:>9.3f}")
+              + f"{r['wB1']:>9.3f}{r['wF3']:>9.3f}"
+              + (f"{r['thr_flow']:>10.4f}" if args.thr_quantile is not None else ""))
+    if args.thr_quantile is not None:
+        # 前向き運用用: 手元の全期間を fit とした flow_tan の絶対閾値(hro-ops --flow-threshold に渡す値)。
+        # eval 月ごとの閾値(上の列)がこれと大きくズレていないことも確認する(分布の安定性)。
+        vals = sorted(it[2]["flow_tan"] for it in items)
+        thr_fwd = vals[min(len(vals) - 1, int(len(vals) * args.thr_quantile))]
+        n_fwd = sum(1 for v in vals if v >= thr_fwd)
+        print(f"\n★ 前向き用 flow_tan 絶対閾値(全期間 {len(items):,} 本の分位 {args.thr_quantile}): "
+              f"{thr_fwd:+.4f}  (>=閾値 {n_fwd:,} 本 = {n_fwd/len(items):.1%})"
+              f"\n   → hro-ops run-day --strategy flow --flow-threshold {thr_fwd:.4f}")
     if args.dump_selections:
         import csv as _csv
         with open(args.dump_selections, "w", newline="", encoding="utf-8") as f:
